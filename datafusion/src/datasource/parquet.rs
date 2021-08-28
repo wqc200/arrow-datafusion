@@ -37,13 +37,13 @@ pub struct ParquetTable {
     path: String,
     schema: SchemaRef,
     statistics: Statistics,
-    max_concurrency: usize,
+    max_partitions: usize,
     enable_pruning: bool,
 }
 
 impl ParquetTable {
     /// Attempt to initialize a new `ParquetTable` from a file path.
-    pub fn try_new(path: impl Into<String>, max_concurrency: usize) -> Result<Self> {
+    pub fn try_new(path: impl Into<String>, max_partitions: usize) -> Result<Self> {
         let path = path.into();
         let parquet_exec = ParquetExec::try_from_path(&path, None, None, 0, 1, None)?;
         let schema = parquet_exec.schema();
@@ -51,9 +51,38 @@ impl ParquetTable {
             path,
             schema,
             statistics: parquet_exec.statistics().to_owned(),
-            max_concurrency,
+            max_partitions,
             enable_pruning: true,
         })
+    }
+
+    /// Attempt to initialize a new `ParquetTable` from a file path and known schema.
+    /// If collect_statistics is `false`, doesn't read files until necessary by scan
+    pub fn try_new_with_schema(
+        path: impl Into<String>,
+        schema: Schema,
+        max_partitions: usize,
+        collect_statistics: bool,
+    ) -> Result<Self> {
+        let path = path.into();
+        if collect_statistics {
+            let parquet_exec = ParquetExec::try_from_path(&path, None, None, 0, 1, None)?;
+            Ok(Self {
+                path,
+                schema: Arc::new(schema),
+                statistics: parquet_exec.statistics().to_owned(),
+                max_partitions,
+                enable_pruning: true,
+            })
+        } else {
+            Ok(Self {
+                path,
+                schema: Arc::new(schema),
+                statistics: Statistics::default(),
+                max_partitions,
+                enable_pruning: true,
+            })
+        }
     }
 
     /// Get the path for the Parquet file(s) represented by this ParquetTable instance
@@ -114,7 +143,7 @@ impl TableProvider for ParquetTable {
             limit
                 .map(|l| std::cmp::min(l, batch_size))
                 .unwrap_or(batch_size),
-            self.max_concurrency,
+            self.max_partitions,
             limit,
         )?))
     }

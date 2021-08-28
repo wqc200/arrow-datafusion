@@ -52,6 +52,50 @@ use datafusion::{
 };
 use datafusion::{execution::context::ExecutionContext, physical_plan::displayable};
 
+/// A macro to assert that one string is contained within another with
+/// a nice error message if they are not.
+///
+/// Usage: `assert_contains!(actual, expected)`
+///
+/// Is a macro so test error
+/// messages are on the same line as the failure;
+///
+/// Both arguments must be convertable into Strings (Into<String>)
+macro_rules! assert_contains {
+    ($ACTUAL: expr, $EXPECTED: expr) => {
+        let actual_value: String = $ACTUAL.into();
+        let expected_value: String = $EXPECTED.into();
+        assert!(
+            actual_value.contains(&expected_value),
+            "Can not find expected in actual.\n\nExpected:\n{}\n\nActual:\n{}",
+            expected_value,
+            actual_value
+        );
+    };
+}
+
+/// A macro to assert that one string is NOT contained within another with
+/// a nice error message if they are are.
+///
+/// Usage: `assert_not_contains!(actual, unexpected)`
+///
+/// Is a macro so test error
+/// messages are on the same line as the failure;
+///
+/// Both arguments must be convertable into Strings (Into<String>)
+macro_rules! assert_not_contains {
+    ($ACTUAL: expr, $UNEXPECTED: expr) => {
+        let actual_value: String = $ACTUAL.into();
+        let unexpected_value: String = $UNEXPECTED.into();
+        assert!(
+            !actual_value.contains(&unexpected_value),
+            "Found unexpected in actual.\n\nUnexpected:\n{}\n\nActual:\n{}",
+            unexpected_value,
+            actual_value
+        );
+    };
+}
+
 #[tokio::test]
 async fn nyc() -> Result<()> {
     // schema for nyxtaxi csv files
@@ -2141,6 +2185,43 @@ async fn csv_explain() {
 }
 
 #[tokio::test]
+async fn csv_explain_analyze() {
+    // This test uses the execute function to run an actual plan under EXPLAIN ANALYZE
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv_by_sql(&mut ctx).await;
+    let sql = "EXPLAIN ANALYZE SELECT count(*), c1 FROM aggregate_test_100 group by c1";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let formatted = arrow::util::pretty::pretty_format_batches(&actual).unwrap();
+    let formatted = normalize_for_explain(&formatted);
+
+    println!("ANALYZE EXPLAIN:\n{}", formatted);
+
+    // Only test basic plumbing and try to avoid having to change too
+    // many things
+    let needle =
+        "CoalescePartitionsExec, metrics=[output_rows=5, elapsed_compute=NOT RECORDED";
+    assert_contains!(&formatted, needle);
+
+    let verbose_needle = "Output Rows";
+    assert_not_contains!(formatted, verbose_needle);
+}
+
+#[tokio::test]
+async fn csv_explain_analyze_verbose() {
+    // This test uses the execute function to run an actual plan under EXPLAIN VERBOSE ANALYZE
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv_by_sql(&mut ctx).await;
+    let sql =
+        "EXPLAIN ANALYZE VERBOSE SELECT count(*), c1 FROM aggregate_test_100 group by c1";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let formatted = arrow::util::pretty::pretty_format_batches(&actual).unwrap();
+    let formatted = normalize_for_explain(&formatted);
+
+    let verbose_needle = "Output Rows";
+    assert_contains!(formatted, verbose_needle);
+}
+
+#[tokio::test]
 async fn csv_explain_plans() {
     // This test verify the look of each plan in its full cycle plan creation
 
@@ -2310,17 +2391,9 @@ async fn csv_explain_plans() {
     // flatten to a single string
     let actual = actual.into_iter().map(|r| r.join("\t")).collect::<String>();
     // Since the plan contains path that are environmentally dependant (e.g. full path of the test file), only verify important content
-    assert!(actual.contains("logical_plan"), "Actual: '{}'", actual);
-    assert!(
-        actual.contains("Projection: #aggregate_test_100.c1"),
-        "Actual: '{}'",
-        actual
-    );
-    assert!(
-        actual.contains("Filter: #aggregate_test_100.c2 Gt Int64(10)"),
-        "Actual: '{}'",
-        actual
-    );
+    assert_contains!(&actual, "logical_plan");
+    assert_contains!(&actual, "Projection: #aggregate_test_100.c1");
+    assert_contains!(actual, "Filter: #aggregate_test_100.c2 Gt Int64(10)");
 }
 
 #[tokio::test]
@@ -2336,20 +2409,12 @@ async fn csv_explain_verbose() {
     // Don't actually test the contents of the debuging output (as
     // that may change and keeping this test updated will be a
     // pain). Instead just check for a few key pieces.
-    assert!(actual.contains("logical_plan"), "Actual: '{}'", actual);
-    assert!(actual.contains("physical_plan"), "Actual: '{}'", actual);
-    assert!(
-        actual.contains("#aggregate_test_100.c2 Gt Int64(10)"),
-        "Actual: '{}'",
-        actual
-    );
+    assert_contains!(&actual, "logical_plan");
+    assert_contains!(&actual, "physical_plan");
+    assert_contains!(&actual, "#aggregate_test_100.c2 Gt Int64(10)");
 
     // ensure the "same text as above" optimization is working
-    assert!(
-        actual.contains("SAME TEXT AS ABOVE"),
-        "Actual 2: '{}'",
-        actual
-    );
+    assert_contains!(actual, "SAME TEXT AS ABOVE");
 }
 
 #[tokio::test]
@@ -2522,23 +2587,36 @@ async fn csv_explain_verbose_plans() {
     let actual = result_vec(&results);
     // flatten to a single string
     let actual = actual.into_iter().map(|r| r.join("\t")).collect::<String>();
-    // Since the plan contains path that are environmentally dependant(e.g. full path of the test file), only verify important content
-    assert!(
-        actual.contains("logical_plan after projection_push_down"),
-        "Actual: '{}'",
-        actual
-    );
-    assert!(actual.contains("physical_plan"), "Actual: '{}'", actual);
-    assert!(
-        actual.contains("FilterExec: CAST(c2@1 AS Int64) > 10"),
-        "Actual: '{}'",
-        actual
-    );
-    assert!(
-        actual.contains("ProjectionExec: expr=[c1@0 as c1]"),
-        "Actual: '{}'",
-        actual
-    );
+    // Since the plan contains path that are environmentally
+    // dependant(e.g. full path of the test file), only verify
+    // important content
+    assert_contains!(&actual, "logical_plan after projection_push_down");
+    assert_contains!(&actual, "physical_plan");
+    assert_contains!(&actual, "FilterExec: CAST(c2@1 AS Int64) > 10");
+    assert_contains!(actual, "ProjectionExec: expr=[c1@0 as c1]");
+}
+
+#[tokio::test]
+async fn explain_analyze_runs_optimizers() {
+    // repro for https://github.com/apache/arrow-datafusion/issues/917
+    // where EXPLAIN ANALYZE was not correctly running optiimizer
+    let mut ctx = ExecutionContext::new();
+    register_alltypes_parquet(&mut ctx);
+
+    // This happens as an optimization pass where count(*) can be
+    // answered using statistics only.
+    let expected = "EmptyExec: produce_one_row=true";
+
+    let sql = "EXPLAIN SELECT count(*) from alltypes_plain";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let actual = arrow::util::pretty::pretty_format_batches(&actual).unwrap();
+    assert_contains!(actual, expected);
+
+    // EXPLAIN ANALYZE should work the same
+    let sql = "EXPLAIN  ANALYZE SELECT count(*) from alltypes_plain";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let actual = arrow::util::pretty::pretty_format_batches(&actual).unwrap();
+    assert_contains!(actual, expected);
 }
 
 fn aggr_test_schema() -> SchemaRef {
@@ -3163,7 +3241,7 @@ async fn query_group_on_null_multi_col() -> Result<()> {
     ];
     assert_batches_sorted_eq!(expected, &actual);
 
-    // Also run query with group columns reversed (results shoudl be the same)
+    // Also run query with group columns reversed (results should be the same)
     let sql = "SELECT COUNT(*), c1, c2 FROM test GROUP BY c2, c1";
     let actual = execute_to_batches(&mut ctx, sql).await;
     assert_batches_sorted_eq!(expected, &actual);
@@ -4081,9 +4159,9 @@ async fn test_cast_expressions_error() -> Result<()> {
     match result {
         Ok(_) => panic!("expected error"),
         Err(e) => {
-            assert!(e.to_string().contains(
-                "Cast error: Cannot cast string 'c' to value of arrow::datatypes::types::Int32Type type"
-            ))
+            assert_contains!(e.to_string(),
+                             "Cast error: Cannot cast string 'c' to value of arrow::datatypes::types::Int32Type type"
+            );
         }
     }
 
@@ -4092,8 +4170,8 @@ async fn test_cast_expressions_error() -> Result<()> {
 
 #[tokio::test]
 async fn test_physical_plan_display_indent() {
-    // Hard code concurrency as it appears in the RepartitionExec output
-    let config = ExecutionConfig::new().with_concurrency(3);
+    // Hard code target_partitions as it appears in the RepartitionExec output
+    let config = ExecutionConfig::new().with_target_partitions(3);
     let mut ctx = ExecutionContext::with_config(config);
     register_aggregate_csv(&mut ctx).unwrap();
     let sql = "SELECT c1, MAX(c12), MIN(c12) as the_min \
@@ -4138,8 +4216,8 @@ async fn test_physical_plan_display_indent() {
 
 #[tokio::test]
 async fn test_physical_plan_display_indent_multi_children() {
-    // Hard code concurrency as it appears in the RepartitionExec output
-    let config = ExecutionConfig::new().with_concurrency(3);
+    // Hard code target_partitions as it appears in the RepartitionExec output
+    let config = ExecutionConfig::new().with_target_partitions(3);
     let mut ctx = ExecutionContext::with_config(config);
     // ensure indenting works for nodes with multiple children
     register_aggregate_csv(&mut ctx).unwrap();
@@ -4233,5 +4311,59 @@ async fn test_partial_qualified_name() -> Result<()> {
     ];
     let actual = execute(&mut ctx, sql).await;
     assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn like_on_strings() -> Result<()> {
+    let input = vec![Some("foo"), Some("bar"), None, Some("fazzz")]
+        .into_iter()
+        .collect::<StringArray>();
+
+    let batch = RecordBatch::try_from_iter(vec![("c1", Arc::new(input) as _)]).unwrap();
+
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+    let mut ctx = ExecutionContext::new();
+    ctx.register_table("test", Arc::new(table))?;
+
+    let sql = "SELECT * FROM test WHERE c1 LIKE '%a%'";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| c1    |",
+        "+-------+",
+        "| bar   |",
+        "| fazzz |",
+        "+-------+",
+    ];
+
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn like_on_string_dictionaries() -> Result<()> {
+    let input = vec![Some("foo"), Some("bar"), None, Some("fazzz")]
+        .into_iter()
+        .collect::<DictionaryArray<Int32Type>>();
+
+    let batch = RecordBatch::try_from_iter(vec![("c1", Arc::new(input) as _)]).unwrap();
+
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+    let mut ctx = ExecutionContext::new();
+    ctx.register_table("test", Arc::new(table))?;
+
+    let sql = "SELECT * FROM test WHERE c1 LIKE '%a%'";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| c1    |",
+        "+-------+",
+        "| bar   |",
+        "| fazzz |",
+        "+-------+",
+    ];
+
+    assert_batches_eq!(expected, &actual);
     Ok(())
 }

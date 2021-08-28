@@ -51,6 +51,7 @@ use datafusion::physical_plan::window_functions::{
 use datafusion::physical_plan::windows::{create_window_expr, WindowAggExec};
 use datafusion::physical_plan::{
     coalesce_batches::CoalesceBatchesExec,
+    cross_join::CrossJoinExec,
     csv::CsvExec,
     empty::EmptyExec,
     expressions::{
@@ -372,6 +373,12 @@ impl TryInto<Arc<dyn ExecutionPlan>> for &protobuf::PhysicalPlanNode {
                     partition_mode,
                 )?))
             }
+            PhysicalPlanType::CrossJoin(crossjoin) => {
+                let left: Arc<dyn ExecutionPlan> = convert_box_required!(crossjoin.left)?;
+                let right: Arc<dyn ExecutionPlan> =
+                    convert_box_required!(crossjoin.right)?;
+                Ok(Arc::new(CrossJoinExec::try_new(left, right)?))
+            }
             PhysicalPlanType::ShuffleWriter(shuffle_writer) => {
                 let input: Arc<dyn ExecutionPlan> =
                     convert_box_required!(shuffle_writer.input)?;
@@ -446,7 +453,6 @@ impl TryInto<Arc<dyn ExecutionPlan>> for &protobuf::PhysicalPlanNode {
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                // Update concurrency here in the future
                 Ok(Arc::new(SortExec::try_new(exprs, input)?))
             }
             PhysicalPlanType::Unresolved(unresolved_shuffle) => {
@@ -501,6 +507,7 @@ impl From<&protobuf::ScalarFunction> for BuiltinScalarFunction {
             ScalarFunction::Totimestamp => BuiltinScalarFunction::ToTimestamp,
             ScalarFunction::Array => BuiltinScalarFunction::Array,
             ScalarFunction::Nullif => BuiltinScalarFunction::NullIf,
+            ScalarFunction::Datepart => BuiltinScalarFunction::DatePart,
             ScalarFunction::Datetrunc => BuiltinScalarFunction::DateTrunc,
             ScalarFunction::Md5 => BuiltinScalarFunction::MD5,
             ScalarFunction::Sha224 => BuiltinScalarFunction::SHA224,

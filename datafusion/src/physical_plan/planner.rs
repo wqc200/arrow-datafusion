@@ -17,9 +17,10 @@
 
 //! Physical query planner
 
+use super::analyze::AnalyzeExec;
 use super::{
-    aggregates, cross_join::CrossJoinExec, empty::EmptyExec, expressions::binary,
-    functions, hash_join::PartitionMode, udaf, union::UnionExec, windows,
+    aggregates, empty::EmptyExec, expressions::binary, functions,
+    hash_join::PartitionMode, udaf, union::UnionExec, windows,
 };
 use crate::execution::context::ExecutionContextState;
 use crate::logical_plan::{
@@ -28,6 +29,7 @@ use crate::logical_plan::{
     UserDefinedLogicalNode,
 };
 use crate::physical_optimizer::optimizer::PhysicalOptimizerRule;
+use crate::physical_plan::cross_join::CrossJoinExec;
 use crate::physical_plan::explain::ExplainExec;
 use crate::physical_plan::expressions;
 use crate::physical_plan::expressions::{CaseExpr, Column, Literal, PhysicalSortExpr};
@@ -324,7 +326,7 @@ impl DefaultPhysicalPlanner {
                 let partition_keys = window_expr_common_partition_keys(window_expr)?;
 
                 let can_repartition = !partition_keys.is_empty()
-                    && ctx_state.config.concurrency > 1
+                    && ctx_state.config.target_partitions > 1
                     && ctx_state.config.repartition_windows;
 
                 let input_exec = if can_repartition {
@@ -341,7 +343,10 @@ impl DefaultPhysicalPlanner {
                         .collect::<Result<Vec<Arc<dyn PhysicalExpr>>>>()?;
                     Arc::new(RepartitionExec::try_new(
                         input_exec,
-                        Partitioning::Hash(partition_keys, ctx_state.config.concurrency),
+                        Partitioning::Hash(
+                            partition_keys,
+                            ctx_state.config.target_partitions,
+                        ),
                     )?)
                 } else {
                     input_exec
@@ -475,7 +480,7 @@ impl DefaultPhysicalPlanner {
                     .any(|x| matches!(x, DataType::Dictionary(_, _)));
 
                 let can_repartition = !groups.is_empty()
-                    && ctx_state.config.concurrency > 1
+                    && ctx_state.config.target_partitions > 1
                     && ctx_state.config.repartition_aggregations
                     && !contains_dict;
 
@@ -488,7 +493,7 @@ impl DefaultPhysicalPlanner {
                         initial_aggr,
                         Partitioning::Hash(
                             final_group.clone(),
-                            ctx_state.config.concurrency,
+                            ctx_state.config.target_partitions,
                         ),
                     )?);
                     // Combine hash aggregates within the partition
@@ -666,7 +671,8 @@ impl DefaultPhysicalPlanner {
                     })
                     .collect::<Result<hash_utils::JoinOn>>()?;
 
-                if ctx_state.config.concurrency > 1 && ctx_state.config.repartition_joins
+                if ctx_state.config.target_partitions > 1
+                    && ctx_state.config.repartition_joins
                 {
                     let (left_expr, right_expr) = join_on
                         .iter()
@@ -682,11 +688,17 @@ impl DefaultPhysicalPlanner {
                     Ok(Arc::new(HashJoinExec::try_new(
                         Arc::new(RepartitionExec::try_new(
                             physical_left,
-                            Partitioning::Hash(left_expr, ctx_state.config.concurrency),
+                            Partitioning::Hash(
+                                left_expr,
+                                ctx_state.config.target_partitions,
+                            ),
                         )?),
                         Arc::new(RepartitionExec::try_new(
                             physical_right,
-                            Partitioning::Hash(right_expr, ctx_state.config.concurrency),
+                            Partitioning::Hash(
+                                right_expr,
+                                ctx_state.config.target_partitions,
+                            ),
                         )?),
                         join_on,
                         join_type,
@@ -741,6 +753,15 @@ impl DefaultPhysicalPlanner {
             LogicalPlan::Explain { .. } => Err(DataFusionError::Internal(
                 "Unsupported logical plan: Explain must be root of the plan".to_string(),
             )),
+            LogicalPlan::Analyze {
+                verbose,
+                input,
+                schema,
+            } => {
+                let input = self.create_initial_plan(input, ctx_state)?;
+                let schema = SchemaRef::new(schema.as_ref().to_owned().into());
+                Ok(Arc::new(AnalyzeExec::new(*verbose, input, schema)))
+            }
             LogicalPlan::Extension { node } => {
                 let physical_inputs = node
                     .inputs()
@@ -1365,6 +1386,7 @@ fn tuple_err<T, R>(value: (Result<T>, Result<R>)) -> Result<(T, R)> {
 mod tests {
     use super::*;
     use crate::logical_plan::{DFField, DFSchema, DFSchemaRef};
+    use crate::physical_plan::DisplayFormatType;
     use crate::physical_plan::{csv::CsvReadOptions, expressions, Partitioning};
     use crate::scalar::ScalarValue;
     use crate::{
@@ -1383,7 +1405,7 @@ mod tests {
 
     fn plan(logical_plan: &LogicalPlan) -> Result<Arc<dyn ExecutionPlan>> {
         let mut ctx_state = make_ctx_state();
-        ctx_state.config.concurrency = 4;
+        ctx_state.config.target_partitions = 4;
         let planner = DefaultPhysicalPlanner::default();
         planner.create_physical_plan(logical_plan, &ctx_state)
     }
@@ -1651,7 +1673,7 @@ mod tests {
         let logical_plan =
             LogicalPlanBuilder::scan_empty(Some("employee"), &schema, None)
                 .unwrap()
-                .explain(true)
+                .explain(true, false)
                 .unwrap()
                 .build()
                 .unwrap();
@@ -1765,6 +1787,18 @@ mod tests {
 
         async fn execute(&self, _partition: usize) -> Result<SendableRecordBatchStream> {
             unimplemented!("NoOpExecutionPlan::execute");
+        }
+
+        fn fmt_as(
+            &self,
+            t: DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            match t {
+                DisplayFormatType::Default => {
+                    write!(f, "NoOpExecutionPlan")
+                }
+            }
         }
     }
 
