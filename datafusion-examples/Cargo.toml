@@ -27,9 +27,13 @@ keywords = [ "arrow", "query", "sql" ]
 edition = "2018"
 publish = false
 
+[[example]]
+name = "avro_sql"
+path = "examples/avro_sql.rs"
+required-features = ["datafusion/avro"]
 
 [dev-dependencies]
-arrow-flight = { version = "^5.2" }
+arrow-flight = { version = "^5.3" }
 datafusion = { path = "../datafusion" }
 prost = "0.8"
 tonic = "0.5"

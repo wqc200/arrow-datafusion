@@ -34,6 +34,8 @@ use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::catalog::catalog::{
     CatalogList, CatalogProvider, MemoryCatalogList, MemoryCatalogProvider,
 };
+use datafusion::datasource::object_store::ObjectStoreRegistry;
+use datafusion::datasource::FilePartition;
 use datafusion::execution::context::{
     ExecutionConfig, ExecutionContextState, ExecutionProps,
 };
@@ -41,9 +43,12 @@ use datafusion::logical_plan::{
     window_frames::WindowFrame, DFSchema, Expr, JoinConstraint, JoinType,
 };
 use datafusion::physical_plan::aggregates::{create_aggregate_expr, AggregateFunction};
+use datafusion::physical_plan::avro::{AvroExec, AvroReadOptions};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::hash_aggregate::{AggregateMode, HashAggregateExec};
 use datafusion::physical_plan::hash_join::PartitionMode;
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::parquet::ParquetPartition;
 use datafusion::physical_plan::planner::DefaultPhysicalPlanner;
 use datafusion::physical_plan::window_functions::{
     BuiltInWindowFunction, WindowFunction,
@@ -69,7 +74,9 @@ use datafusion::physical_plan::{
     sort::{SortExec, SortOptions},
     Partitioning,
 };
-use datafusion::physical_plan::{AggregateExpr, ExecutionPlan, PhysicalExpr, WindowExpr};
+use datafusion::physical_plan::{
+    AggregateExpr, ExecutionPlan, PhysicalExpr, Statistics, WindowExpr,
+};
 use datafusion::prelude::CsvReadOptions;
 use log::debug;
 use protobuf::physical_expr_node::ExprType;
@@ -129,15 +136,36 @@ impl TryInto<Arc<dyn ExecutionPlan>> for &protobuf::PhysicalPlanNode {
                 )?))
             }
             PhysicalPlanType::ParquetScan(scan) => {
+                let partitions = scan
+                    .partitions
+                    .iter()
+                    .map(|p| p.try_into())
+                    .collect::<Result<Vec<ParquetPartition>, _>>()?;
+                let schema = Arc::new(convert_required!(scan.schema)?);
                 let projection = scan.projection.iter().map(|i| *i as usize).collect();
-                let filenames: Vec<&str> =
-                    scan.filename.iter().map(|s| s.as_str()).collect();
-                Ok(Arc::new(ParquetExec::try_from_files(
-                    &filenames,
+                Ok(Arc::new(ParquetExec::new(
+                    partitions,
+                    schema,
                     Some(projection),
+                    Statistics::default(),
+                    ExecutionPlanMetricsSet::new(),
                     None,
                     scan.batch_size as usize,
-                    scan.num_partitions as usize,
+                    None,
+                )))
+            }
+            PhysicalPlanType::AvroScan(scan) => {
+                let schema = Arc::new(convert_required!(scan.schema)?);
+                let options = AvroReadOptions {
+                    schema: Some(schema),
+                    file_extension: &scan.file_extension,
+                };
+                let projection = scan.projection.iter().map(|i| *i as usize).collect();
+                Ok(Arc::new(AvroExec::try_from_path(
+                    &scan.path,
+                    options,
+                    Some(projection),
+                    scan.batch_size as usize,
                     None,
                 )?))
             }
@@ -470,6 +498,23 @@ impl TryInto<Arc<dyn ExecutionPlan>> for &protobuf::PhysicalPlanNode {
     }
 }
 
+impl TryInto<ParquetPartition> for &protobuf::ParquetPartition {
+    type Error = BallistaError;
+
+    fn try_into(self) -> Result<ParquetPartition, Self::Error> {
+        let files = self
+            .files
+            .iter()
+            .map(|f| f.try_into())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ParquetPartition::new(
+            files,
+            self.index as usize,
+            ExecutionPlanMetricsSet::new(),
+        ))
+    }
+}
+
 impl From<&protobuf::PhysicalColumn> for Column {
     fn from(c: &protobuf::PhysicalColumn) -> Column {
         Column::new(&c.name, c.index as usize)
@@ -515,6 +560,7 @@ impl From<&protobuf::ScalarFunction> for BuiltinScalarFunction {
             ScalarFunction::Sha384 => BuiltinScalarFunction::SHA384,
             ScalarFunction::Sha512 => BuiltinScalarFunction::SHA512,
             ScalarFunction::Ln => BuiltinScalarFunction::Ln,
+            ScalarFunction::Totimestampmillis => BuiltinScalarFunction::ToTimestampMillis,
         }
     }
 }
@@ -620,6 +666,7 @@ impl TryFrom<&protobuf::PhysicalExprNode> for Arc<dyn PhysicalExpr> {
 
                 let catalog_list =
                     Arc::new(MemoryCatalogList::new()) as Arc<dyn CatalogList>;
+
                 let ctx_state = ExecutionContextState {
                     catalog_list,
                     scalar_functions: Default::default(),
@@ -627,6 +674,7 @@ impl TryFrom<&protobuf::PhysicalExprNode> for Arc<dyn PhysicalExpr> {
                     aggregate_functions: Default::default(),
                     config: ExecutionConfig::new(),
                     execution_props: ExecutionProps::new(),
+                    object_store_registry: Arc::new(ObjectStoreRegistry::new()),
                 };
 
                 let fun_expr = functions::create_physical_fun(

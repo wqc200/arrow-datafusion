@@ -21,6 +21,8 @@ use crate::error::BallistaError;
 use crate::serde::{from_proto_binary_op, proto_error, protobuf};
 use crate::{convert_box_required, convert_required};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use datafusion::datasource::parquet::{ParquetTable, ParquetTableDescriptor};
+use datafusion::datasource::{PartitionedFile, TableDescriptor};
 use datafusion::logical_plan::window_frames::{
     WindowFrame, WindowFrameBound, WindowFrameUnits,
 };
@@ -30,6 +32,7 @@ use datafusion::logical_plan::{
     LogicalPlan, LogicalPlanBuilder, Operator,
 };
 use datafusion::physical_plan::aggregates::AggregateFunction;
+use datafusion::physical_plan::avro::AvroReadOptions;
 use datafusion::physical_plan::csv::CsvReadOptions;
 use datafusion::physical_plan::window_functions::BuiltInWindowFunction;
 use datafusion::scalar::ScalarValue;
@@ -134,10 +137,11 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                 .map_err(|e| e.into())
             }
             LogicalPlanType::ParquetScan(scan) => {
+                let descriptor: TableDescriptor = convert_required!(scan.table_desc)?;
                 let projection = match scan.projection.as_ref() {
                     None => None,
                     Some(columns) => {
-                        let schema: Schema = convert_required!(scan.schema)?;
+                        let schema = descriptor.schema.clone();
                         let r: Result<Vec<usize>, _> = columns
                             .columns
                             .iter()
@@ -154,12 +158,43 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                         Some(r?)
                     }
                 };
-                LogicalPlanBuilder::scan_parquet_with_name(
-                    &scan.path,
-                    projection,
+
+                let parquet_table = ParquetTable::try_new_with_desc(
+                    Arc::new(ParquetTableDescriptor { descriptor }),
                     24,
+                    true,
+                )?;
+                LogicalPlanBuilder::scan(
                     &scan.table_name,
+                    Arc::new(parquet_table),
+                    projection,
                 )? //TODO remove hard-coded max_partitions
+                .build()
+                .map_err(|e| e.into())
+            }
+            LogicalPlanType::AvroScan(scan) => {
+                let schema: Schema = convert_required!(scan.schema)?;
+                let options = AvroReadOptions {
+                    schema: Some(Arc::new(schema.clone())),
+                    file_extension: &scan.file_extension,
+                };
+
+                let mut projection = None;
+                if let Some(columns) = &scan.projection {
+                    let column_indices = columns
+                        .columns
+                        .iter()
+                        .map(|name| schema.index_of(name))
+                        .collect::<Result<Vec<usize>, _>>()?;
+                    projection = Some(column_indices);
+                }
+
+                LogicalPlanBuilder::scan_avro_with_name(
+                    &scan.path,
+                    options,
+                    projection,
+                    &scan.table_name,
+                )?
                 .build()
                 .map_err(|e| e.into())
             }
@@ -298,6 +333,61 @@ impl TryInto<LogicalPlan> for &protobuf::LogicalPlanNode {
                     .map_err(|e| e.into())
             }
         }
+    }
+}
+
+impl TryInto<TableDescriptor> for &protobuf::TableDescriptor {
+    type Error = BallistaError;
+
+    fn try_into(self) -> Result<TableDescriptor, Self::Error> {
+        let partition_files = self
+            .partition_files
+            .iter()
+            .map(|f| f.try_into())
+            .collect::<Result<Vec<PartitionedFile>, _>>()?;
+        let schema = convert_required!(self.schema)?;
+        Ok(TableDescriptor {
+            path: self.path.to_owned(),
+            partition_files,
+            schema: Arc::new(schema),
+        })
+    }
+}
+
+impl TryInto<PartitionedFile> for &protobuf::PartitionedFile {
+    type Error = BallistaError;
+
+    fn try_into(self) -> Result<PartitionedFile, Self::Error> {
+        let statistics = convert_required!(self.statistics)?;
+        Ok(PartitionedFile {
+            path: self.path.clone(),
+            statistics,
+        })
+    }
+}
+
+impl From<&protobuf::ColumnStats> for ColumnStatistics {
+    fn from(cs: &protobuf::ColumnStats) -> ColumnStatistics {
+        ColumnStatistics {
+            null_count: Some(cs.null_count as usize),
+            max_value: cs.max_value.as_ref().map(|m| m.try_into().unwrap()),
+            min_value: cs.min_value.as_ref().map(|m| m.try_into().unwrap()),
+            distinct_count: Some(cs.distinct_count as usize),
+        }
+    }
+}
+
+impl TryInto<Statistics> for &protobuf::Statistics {
+    type Error = BallistaError;
+
+    fn try_into(self) -> Result<Statistics, Self::Error> {
+        let column_statistics = self.column_stats.iter().map(|s| s.into()).collect();
+        Ok(Statistics {
+            num_rows: Some(self.num_rows as usize),
+            total_byte_size: Some(self.total_byte_size as usize),
+            column_statistics: Some(column_statistics),
+            is_exact: self.is_exact,
+        })
     }
 }
 
@@ -1114,7 +1204,8 @@ impl TryInto<Field> for &protobuf::Field {
     }
 }
 
-use datafusion::physical_plan::{aggregates, windows};
+use crate::serde::protobuf::ColumnStats;
+use datafusion::physical_plan::{aggregates, windows, ColumnStatistics, Statistics};
 use datafusion::prelude::{
     array, date_part, date_trunc, length, lower, ltrim, md5, rtrim, sha224, sha256,
     sha384, sha512, trim, upper,
@@ -1129,6 +1220,7 @@ impl TryFrom<i32> for protobuf::FileType {
             _x if _x == FileType::NdJson as i32 => Ok(FileType::NdJson),
             _x if _x == FileType::Parquet as i32 => Ok(FileType::Parquet),
             _x if _x == FileType::Csv as i32 => Ok(FileType::Csv),
+            _x if _x == FileType::Avro as i32 => Ok(FileType::Avro),
             invalid => Err(BallistaError::General(format!(
                 "Attempted to convert invalid i32 to protobuf::Filetype: {}",
                 invalid
@@ -1145,6 +1237,7 @@ impl Into<datafusion::sql::parser::FileType> for protobuf::FileType {
             protobuf::FileType::NdJson => FileType::NdJson,
             protobuf::FileType::Parquet => FileType::Parquet,
             protobuf::FileType::Csv => FileType::CSV,
+            protobuf::FileType::Avro => FileType::Avro,
         }
     }
 }

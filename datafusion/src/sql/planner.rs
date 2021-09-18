@@ -49,7 +49,7 @@ use sqlparser::ast::{
     BinaryOperator, DataType as SQLDataType, DateTimeField, Expr as SQLExpr, FunctionArg,
     Ident, Join, JoinConstraint, JoinOperator, ObjectName, Query, Select, SelectItem,
     SetExpr, SetOperator, ShowStatementFilter, TableFactor, TableWithJoins,
-    UnaryOperator, Value,
+    TrimWhereField, UnaryOperator, Value,
 };
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
 use sqlparser::ast::{OrderByExpr, Statement};
@@ -212,6 +212,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 }
             }
             FileType::NdJson => {}
+            FileType::Avro => {}
         };
 
         let schema = self.build_schema(columns)?;
@@ -1262,6 +1263,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     BinaryOperator::Or => Ok(Operator::Or),
                     BinaryOperator::Like => Ok(Operator::Like),
                     BinaryOperator::NotLike => Ok(Operator::NotLike),
+                    BinaryOperator::PGRegexMatch => Ok(Operator::RegexMatch),
+                    BinaryOperator::PGRegexIMatch => Ok(Operator::RegexIMatch),
+                    BinaryOperator::PGRegexNotMatch => Ok(Operator::RegexNotMatch),
+                    BinaryOperator::PGRegexNotIMatch => Ok(Operator::RegexNotIMatch),
                     _ => Err(DataFusionError::NotImplemented(format!(
                         "Unsupported SQL binary operator {:?}",
                         op
@@ -1276,21 +1281,27 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
 
             SQLExpr::Trim { expr, trim_where } => {
-                let fun = match trim_where {
-                    Some((trim_where, _expr)) => {
-                        return Err(DataFusionError::Plan(format!(
-                            "TRIM {} is not yet supported ",
-                            trim_where
-                        )))
+                let (fun, where_expr) = match trim_where {
+                    Some((TrimWhereField::Leading, expr)) => {
+                        (functions::BuiltinScalarFunction::Ltrim, Some(expr))
                     }
-                    None => functions::BuiltinScalarFunction::Trim,
+                    Some((TrimWhereField::Trailing, expr)) => {
+                        (functions::BuiltinScalarFunction::Rtrim, Some(expr))
+                    }
+                    Some((TrimWhereField::Both, expr)) => {
+                        (functions::BuiltinScalarFunction::Btrim, Some(expr))
+                    }
+                    None => (functions::BuiltinScalarFunction::Trim, None),
                 };
-
                 let arg = self.sql_expr_to_logical_expr(expr, schema)?;
-                Ok(Expr::ScalarFunction {
-                    fun,
-                    args: vec![arg],
-                })
+                let args = match where_expr {
+                    Some(to_trim) => {
+                        let to_trim = self.sql_expr_to_logical_expr(to_trim, schema)?;
+                        vec![arg, to_trim]
+                    }
+                    None => vec![arg],
+                };
+                Ok(Expr::ScalarFunction { fun, args })
             }
 
             SQLExpr::Function(function) => {

@@ -27,20 +27,19 @@ use chrono::Duration;
 extern crate arrow;
 extern crate datafusion;
 
-use arrow::{array::*, datatypes::TimeUnit};
-use arrow::{datatypes::Int32Type, datatypes::Int64Type, record_batch::RecordBatch};
 use arrow::{
-    datatypes::{
-        ArrowNativeType, ArrowPrimitiveType, ArrowTimestampType, DataType, Field, Schema,
-        SchemaRef, TimestampMicrosecondType, TimestampMillisecondType,
-        TimestampNanosecondType, TimestampSecondType,
-    },
+    array::*, datatypes::*, record_batch::RecordBatch,
     util::display::array_value_to_string,
 };
 
 use datafusion::assert_batches_eq;
 use datafusion::assert_batches_sorted_eq;
 use datafusion::logical_plan::LogicalPlan;
+#[cfg(feature = "avro")]
+use datafusion::physical_plan::avro::AvroReadOptions;
+use datafusion::physical_plan::metrics::MetricValue;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::ExecutionPlanVisitor;
 use datafusion::prelude::*;
 use datafusion::{
     datasource::{csv::CsvReadOptions, MemTable},
@@ -163,18 +162,18 @@ async fn parquet_query() {
     let sql = "SELECT id, CAST(string_col AS varchar) FROM alltypes_plain";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+----+--------------------------+",
-        "| id | CAST(string_col AS Utf8) |",
-        "+----+--------------------------+",
-        "| 4  | 0                        |",
-        "| 5  | 1                        |",
-        "| 6  | 0                        |",
-        "| 7  | 1                        |",
-        "| 2  | 0                        |",
-        "| 3  | 1                        |",
-        "| 0  | 0                        |",
-        "| 1  | 1                        |",
-        "+----+--------------------------+",
+        "+----+-----------------------------------------+",
+        "| id | CAST(alltypes_plain.string_col AS Utf8) |",
+        "+----+-----------------------------------------+",
+        "| 4  | 0                                       |",
+        "| 5  | 1                                       |",
+        "| 6  | 0                                       |",
+        "| 7  | 1                                       |",
+        "| 2  | 0                                       |",
+        "| 3  | 1                                       |",
+        "| 0  | 0                                       |",
+        "| 1  | 1                                       |",
+        "+----+-----------------------------------------+",
     ];
 
     assert_batches_eq!(expected, &actual);
@@ -335,11 +334,11 @@ async fn csv_count_star() -> Result<()> {
     let sql = "SELECT COUNT(*), COUNT(1) AS c, COUNT(c1) FROM aggregate_test_100";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+-----------------+-----+-----------+",
-        "| COUNT(UInt8(1)) | c   | COUNT(c1) |",
-        "+-----------------+-----+-----------+",
-        "| 100             | 100 | 100       |",
-        "+-----------------+-----+-----------+",
+        "+-----------------+-----+------------------------------+",
+        "| COUNT(UInt8(1)) | c   | COUNT(aggregate_test_100.c1) |",
+        "+-----------------+-----+------------------------------+",
+        "| 100             | 100 | 100                          |",
+        "+-----------------+-----+------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -439,15 +438,15 @@ async fn csv_query_group_by_int_min_max() -> Result<()> {
     let sql = "SELECT c2, MIN(c12), MAX(c12) FROM aggregate_test_100 GROUP BY c2";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+----+----------------------+--------------------+",
-        "| c2 | MIN(c12)             | MAX(c12)           |",
-        "+----+----------------------+--------------------+",
-        "| 1  | 0.05636955101974106  | 0.9965400387585364 |",
-        "| 2  | 0.16301110515739792  | 0.991517828651004  |",
-        "| 3  | 0.047343434291126085 | 0.9293883502480845 |",
-        "| 4  | 0.02182578039211991  | 0.9237877978193884 |",
-        "| 5  | 0.01479305307777301  | 0.9723580396501548 |",
-        "+----+----------------------+--------------------+",
+        "+----+-----------------------------+-----------------------------+",
+        "| c2 | MIN(aggregate_test_100.c12) | MAX(aggregate_test_100.c12) |",
+        "+----+-----------------------------+-----------------------------+",
+        "| 1  | 0.05636955101974106         | 0.9965400387585364          |",
+        "| 2  | 0.16301110515739792         | 0.991517828651004           |",
+        "| 3  | 0.047343434291126085        | 0.9293883502480845          |",
+        "| 4  | 0.02182578039211991         | 0.9237877978193884          |",
+        "| 5  | 0.01479305307777301         | 0.9723580396501548          |",
+        "+----+-----------------------------+-----------------------------+",
     ];
     assert_batches_sorted_eq!(expected, &actual);
     Ok(())
@@ -663,35 +662,35 @@ async fn csv_query_group_by_two_columns() -> Result<()> {
     let sql = "SELECT c1, c2, MIN(c3) FROM aggregate_test_100 GROUP BY c1, c2";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+----+----+---------+",
-        "| c1 | c2 | MIN(c3) |",
-        "+----+----+---------+",
-        "| a  | 1  | -85     |",
-        "| a  | 2  | -48     |",
-        "| a  | 3  | -72     |",
-        "| a  | 4  | -101    |",
-        "| a  | 5  | -101    |",
-        "| b  | 1  | 12      |",
-        "| b  | 2  | -60     |",
-        "| b  | 3  | -101    |",
-        "| b  | 4  | -117    |",
-        "| b  | 5  | -82     |",
-        "| c  | 1  | -24     |",
-        "| c  | 2  | -117    |",
-        "| c  | 3  | -2      |",
-        "| c  | 4  | -90     |",
-        "| c  | 5  | -94     |",
-        "| d  | 1  | -99     |",
-        "| d  | 2  | 93      |",
-        "| d  | 3  | -76     |",
-        "| d  | 4  | 5       |",
-        "| d  | 5  | -59     |",
-        "| e  | 1  | 36      |",
-        "| e  | 2  | -61     |",
-        "| e  | 3  | -95     |",
-        "| e  | 4  | -56     |",
-        "| e  | 5  | -86     |",
-        "+----+----+---------+",
+        "+----+----+----------------------------+",
+        "| c1 | c2 | MIN(aggregate_test_100.c3) |",
+        "+----+----+----------------------------+",
+        "| a  | 1  | -85                        |",
+        "| a  | 2  | -48                        |",
+        "| a  | 3  | -72                        |",
+        "| a  | 4  | -101                       |",
+        "| a  | 5  | -101                       |",
+        "| b  | 1  | 12                         |",
+        "| b  | 2  | -60                        |",
+        "| b  | 3  | -101                       |",
+        "| b  | 4  | -117                       |",
+        "| b  | 5  | -82                        |",
+        "| c  | 1  | -24                        |",
+        "| c  | 2  | -117                       |",
+        "| c  | 3  | -2                         |",
+        "| c  | 4  | -90                        |",
+        "| c  | 5  | -94                        |",
+        "| d  | 1  | -99                        |",
+        "| d  | 2  | 93                         |",
+        "| d  | 3  | -76                        |",
+        "| d  | 4  | 5                          |",
+        "| d  | 5  | -59                        |",
+        "| e  | 1  | 36                         |",
+        "| e  | 2  | -61                        |",
+        "| e  | 3  | -95                        |",
+        "| e  | 4  | -56                        |",
+        "| e  | 5  | -86                        |",
+        "+----+----+----------------------------+",
     ];
     assert_batches_sorted_eq!(expected, &actual);
     Ok(())
@@ -887,15 +886,15 @@ async fn csv_query_group_by_avg() -> Result<()> {
     let sql = "SELECT c1, avg(c12) FROM aggregate_test_100 GROUP BY c1";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+----+---------------------+",
-        "| c1 | AVG(c12)            |",
-        "+----+---------------------+",
-        "| a  | 0.48754517466109415 |",
-        "| b  | 0.41040709263815384 |",
-        "| c  | 0.6600456536439784  |",
-        "| d  | 0.48855379387549824 |",
-        "| e  | 0.48600669271341534 |",
-        "+----+---------------------+",
+        "+----+-----------------------------+",
+        "| c1 | AVG(aggregate_test_100.c12) |",
+        "+----+-----------------------------+",
+        "| a  | 0.48754517466109415         |",
+        "| b  | 0.41040709263815384         |",
+        "| c  | 0.6600456536439784          |",
+        "| d  | 0.48855379387549824         |",
+        "| e  | 0.48600669271341534         |",
+        "+----+-----------------------------+",
     ];
     assert_batches_sorted_eq!(expected, &actual);
     Ok(())
@@ -908,15 +907,15 @@ async fn csv_query_group_by_avg_with_projection() -> Result<()> {
     let sql = "SELECT avg(c12), c1 FROM aggregate_test_100 GROUP BY c1";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+---------------------+----+",
-        "| AVG(c12)            | c1 |",
-        "+---------------------+----+",
-        "| 0.41040709263815384 | b  |",
-        "| 0.48600669271341534 | e  |",
-        "| 0.48754517466109415 | a  |",
-        "| 0.48855379387549824 | d  |",
-        "| 0.6600456536439784  | c  |",
-        "+---------------------+----+",
+        "+-----------------------------+----+",
+        "| AVG(aggregate_test_100.c12) | c1 |",
+        "+-----------------------------+----+",
+        "| 0.41040709263815384         | b  |",
+        "| 0.48600669271341534         | e  |",
+        "| 0.48754517466109415         | a  |",
+        "| 0.48855379387549824         | d  |",
+        "| 0.6600456536439784          | c  |",
+        "+-----------------------------+----+",
     ];
     assert_batches_sorted_eq!(expected, &actual);
     Ok(())
@@ -972,11 +971,11 @@ async fn csv_query_count() -> Result<()> {
     let sql = "SELECT count(c12) FROM aggregate_test_100";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+------------+",
-        "| COUNT(c12) |",
-        "+------------+",
-        "| 100        |",
-        "+------------+",
+        "+-------------------------------+",
+        "| COUNT(aggregate_test_100.c12) |",
+        "+-------------------------------+",
+        "| 100                           |",
+        "+-------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -999,15 +998,15 @@ async fn csv_query_window_with_empty_over() -> Result<()> {
                limit 5";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+-----------+-----------+------------+-------------+-----------------+----------------+------------------------+",
-        "| c9        | COUNT(c5) | MAX(c5)    | MIN(c5)     | FIRST_VALUE(c5) | LAST_VALUE(c5) | NTH_VALUE(c5,Int64(2)) |",
-        "+-----------+-----------+------------+-------------+-----------------+----------------+------------------------+",
-        "| 28774375  | 100       | 2143473091 | -2141999138 | 2033001162      | 61035129       | 706441268              |",
-        "| 63044568  | 100       | 2143473091 | -2141999138 | 2033001162      | 61035129       | 706441268              |",
-        "| 141047417 | 100       | 2143473091 | -2141999138 | 2033001162      | 61035129       | 706441268              |",
-        "| 141680161 | 100       | 2143473091 | -2141999138 | 2033001162      | 61035129       | 706441268              |",
-        "| 145294611 | 100       | 2143473091 | -2141999138 | 2033001162      | 61035129       | 706441268              |",
-        "+-----------+-----------+------------+-------------+-----------------+----------------+------------------------+",
+        "+-----------+------------------------------+----------------------------+----------------------------+------------------------------------+-----------------------------------+-------------------------------------------+",
+        "| c9        | COUNT(aggregate_test_100.c5) | MAX(aggregate_test_100.c5) | MIN(aggregate_test_100.c5) | FIRST_VALUE(aggregate_test_100.c5) | LAST_VALUE(aggregate_test_100.c5) | NTH_VALUE(aggregate_test_100.c5,Int64(2)) |",
+        "+-----------+------------------------------+----------------------------+----------------------------+------------------------------------+-----------------------------------+-------------------------------------------+",
+        "| 28774375  | 100                          | 2143473091                 | -2141999138                | 2033001162                         | 61035129                          | 706441268                                 |",
+        "| 63044568  | 100                          | 2143473091                 | -2141999138                | 2033001162                         | 61035129                          | 706441268                                 |",
+        "| 141047417 | 100                          | 2143473091                 | -2141999138                | 2033001162                         | 61035129                          | 706441268                                 |",
+        "| 141680161 | 100                          | 2143473091                 | -2141999138                | 2033001162                         | 61035129                          | 706441268                                 |",
+        "| 145294611 | 100                          | 2143473091                 | -2141999138                | 2033001162                         | 61035129                          | 706441268                                 |",
+        "+-----------+------------------------------+----------------------------+----------------------------+------------------------------------+-----------------------------------+-------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -1032,15 +1031,15 @@ async fn csv_query_window_with_partition_by() -> Result<()> {
                limit 5";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+-----------+------------------------+------------------------+--------------------------+------------------------+------------------------+--------------------------------+-------------------------------+---------------------------------------+",
-        "| c9        | SUM(CAST(c4 AS Int32)) | AVG(CAST(c4 AS Int32)) | COUNT(CAST(c4 AS Int32)) | MAX(CAST(c4 AS Int32)) | MIN(CAST(c4 AS Int32)) | FIRST_VALUE(CAST(c4 AS Int32)) | LAST_VALUE(CAST(c4 AS Int32)) | NTH_VALUE(CAST(c4 AS Int32),Int64(2)) |",
-        "+-----------+------------------------+------------------------+--------------------------+------------------------+------------------------+--------------------------------+-------------------------------+---------------------------------------+",
-        "| 28774375  | -16110                 | -16110                 | 1                        | -16110                 | -16110                 | -16110                         | -16110                        |                                       |",
-        "| 63044568  | 3917                   | 3917                   | 1                        | 3917                   | 3917                   | 3917                           | 3917                          |                                       |",
-        "| 141047417 | -38455                 | -19227.5               | 2                        | -16974                 | -21481                 | -16974                         | -21481                        |                                       |",
-        "| 141680161 | -1114                  | -1114                  | 1                        | -1114                  | -1114                  | -1114                          | -1114                         |                                       |",
-        "| 145294611 | 15673                  | 15673                  | 1                        | 15673                  | 15673                  | 15673                          | 15673                         |                                       |",
-        "+-----------+------------------------+------------------------+--------------------------+------------------------+------------------------+--------------------------------+-------------------------------+---------------------------------------+",
+        "+-----------+-------------------------------------------+-------------------------------------------+---------------------------------------------+-------------------------------------------+-------------------------------------------+---------------------------------------------------+--------------------------------------------------+----------------------------------------------------------+",
+        "| c9        | SUM(CAST(aggregate_test_100.c4 AS Int32)) | AVG(CAST(aggregate_test_100.c4 AS Int32)) | COUNT(CAST(aggregate_test_100.c4 AS Int32)) | MAX(CAST(aggregate_test_100.c4 AS Int32)) | MIN(CAST(aggregate_test_100.c4 AS Int32)) | FIRST_VALUE(CAST(aggregate_test_100.c4 AS Int32)) | LAST_VALUE(CAST(aggregate_test_100.c4 AS Int32)) | NTH_VALUE(CAST(aggregate_test_100.c4 AS Int32),Int64(2)) |",
+        "+-----------+-------------------------------------------+-------------------------------------------+---------------------------------------------+-------------------------------------------+-------------------------------------------+---------------------------------------------------+--------------------------------------------------+----------------------------------------------------------+",
+        "| 28774375  | -16110                                    | -16110                                    | 1                                           | -16110                                    | -16110                                    | -16110                                            | -16110                                           |                                                          |",
+        "| 63044568  | 3917                                      | 3917                                      | 1                                           | 3917                                      | 3917                                      | 3917                                              | 3917                                             |                                                          |",
+        "| 141047417 | -38455                                    | -19227.5                                  | 2                                           | -16974                                    | -21481                                    | -16974                                            | -21481                                           |                                                          |",
+        "| 141680161 | -1114                                     | -1114                                     | 1                                           | -1114                                     | -1114                                     | -1114                                             | -1114                                            |                                                          |",
+        "| 145294611 | 15673                                     | 15673                                     | 1                                           | 15673                                     | 15673                                     | 15673                                             | 15673                                            |                                                          |",
+        "+-----------+-------------------------------------------+-------------------------------------------+---------------------------------------------+-------------------------------------------+-------------------------------------------+---------------------------------------------------+--------------------------------------------------+----------------------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -1065,15 +1064,15 @@ async fn csv_query_window_with_order_by() -> Result<()> {
                limit 5";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+-----------+-------------+--------------------+-----------+-----------+-------------+-----------------+----------------+------------------------+",
-        "| c9        | SUM(c5)     | AVG(c5)            | COUNT(c5) | MAX(c5)   | MIN(c5)     | FIRST_VALUE(c5) | LAST_VALUE(c5) | NTH_VALUE(c5,Int64(2)) |",
-        "+-----------+-------------+--------------------+-----------+-----------+-------------+-----------------+----------------+------------------------+",
-        "| 28774375  | 61035129    | 61035129           | 1         | 61035129  | 61035129    | 61035129        | 61035129       |                        |",
-        "| 63044568  | -47938237   | -23969118.5        | 2         | 61035129  | -108973366  | 61035129        | -108973366     | -108973366             |",
-        "| 141047417 | 575165281   | 191721760.33333334 | 3         | 623103518 | -108973366  | 61035129        | 623103518      | -108973366             |",
-        "| 141680161 | -1352462829 | -338115707.25      | 4         | 623103518 | -1927628110 | 61035129        | -1927628110    | -108973366             |",
-        "| 145294611 | -3251637940 | -650327588         | 5         | 623103518 | -1927628110 | 61035129        | -1899175111    | -108973366             |",
-        "+-----------+-------------+--------------------+-----------+-----------+-------------+-----------------+----------------+------------------------+",
+        "+-----------+----------------------------+----------------------------+------------------------------+----------------------------+----------------------------+------------------------------------+-----------------------------------+-------------------------------------------+",
+        "| c9        | SUM(aggregate_test_100.c5) | AVG(aggregate_test_100.c5) | COUNT(aggregate_test_100.c5) | MAX(aggregate_test_100.c5) | MIN(aggregate_test_100.c5) | FIRST_VALUE(aggregate_test_100.c5) | LAST_VALUE(aggregate_test_100.c5) | NTH_VALUE(aggregate_test_100.c5,Int64(2)) |",
+        "+-----------+----------------------------+----------------------------+------------------------------+----------------------------+----------------------------+------------------------------------+-----------------------------------+-------------------------------------------+",
+        "| 28774375  | 61035129                   | 61035129                   | 1                            | 61035129                   | 61035129                   | 61035129                           | 61035129                          |                                           |",
+        "| 63044568  | -47938237                  | -23969118.5                | 2                            | 61035129                   | -108973366                 | 61035129                           | -108973366                        | -108973366                                |",
+        "| 141047417 | 575165281                  | 191721760.33333334         | 3                            | 623103518                  | -108973366                 | 61035129                           | 623103518                         | -108973366                                |",
+        "| 141680161 | -1352462829                | -338115707.25              | 4                            | 623103518                  | -1927628110                | 61035129                           | -1927628110                       | -108973366                                |",
+        "| 145294611 | -3251637940                | -650327588                 | 5                            | 623103518                  | -1927628110                | 61035129                           | -1899175111                       | -108973366                                |",
+        "+-----------+----------------------------+----------------------------+------------------------------+----------------------------+----------------------------+------------------------------------+-----------------------------------+-------------------------------------------+",
     ];
     assert_batches_eq!(expected, &actual);
     Ok(())
@@ -1086,15 +1085,15 @@ async fn csv_query_group_by_int_count() -> Result<()> {
     let sql = "SELECT c1, count(c12) FROM aggregate_test_100 GROUP BY c1";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+----+------------+",
-        "| c1 | COUNT(c12) |",
-        "+----+------------+",
-        "| a  | 21         |",
-        "| b  | 19         |",
-        "| c  | 21         |",
-        "| d  | 18         |",
-        "| e  | 21         |",
-        "+----+------------+",
+        "+----+-------------------------------+",
+        "| c1 | COUNT(aggregate_test_100.c12) |",
+        "+----+-------------------------------+",
+        "| a  | 21                            |",
+        "| b  | 19                            |",
+        "| c  | 21                            |",
+        "| d  | 18                            |",
+        "| e  | 21                            |",
+        "+----+-------------------------------+",
     ];
     assert_batches_sorted_eq!(expected, &actual);
     Ok(())
@@ -1128,15 +1127,15 @@ async fn csv_query_group_by_string_min_max() -> Result<()> {
     let sql = "SELECT c1, MIN(c12), MAX(c12) FROM aggregate_test_100 GROUP BY c1";
     let actual = execute_to_batches(&mut ctx, sql).await;
     let expected = vec![
-        "+----+----------------------+--------------------+",
-        "| c1 | MIN(c12)             | MAX(c12)           |",
-        "+----+----------------------+--------------------+",
-        "| a  | 0.02182578039211991  | 0.9800193410444061 |",
-        "| b  | 0.04893135681998029  | 0.9185813970744787 |",
-        "| c  | 0.0494924465469434   | 0.991517828651004  |",
-        "| d  | 0.061029375346466685 | 0.9748360509016578 |",
-        "| e  | 0.01479305307777301  | 0.9965400387585364 |",
-        "+----+----------------------+--------------------+",
+        "+----+-----------------------------+-----------------------------+",
+        "| c1 | MIN(aggregate_test_100.c12) | MAX(aggregate_test_100.c12) |",
+        "+----+-----------------------------+-----------------------------+",
+        "| a  | 0.02182578039211991         | 0.9800193410444061          |",
+        "| b  | 0.04893135681998029         | 0.9185813970744787          |",
+        "| c  | 0.0494924465469434          | 0.991517828651004           |",
+        "| d  | 0.061029375346466685        | 0.9748360509016578          |",
+        "| e  | 0.01479305307777301         | 0.9965400387585364          |",
+        "+----+-----------------------------+-----------------------------+",
     ];
     assert_batches_sorted_eq!(expected, &actual);
     Ok(())
@@ -1894,6 +1893,28 @@ async fn left_join() -> Result<()> {
 }
 
 #[tokio::test]
+async fn left_join_unbalanced() -> Result<()> {
+    // the t1_id is larger than t2_id so the hash_build_probe_order optimizer should kick in
+    let mut ctx = create_join_context_unbalanced("t1_id", "t2_id")?;
+    let equivalent_sql = [
+        "SELECT t1_id, t1_name, t2_name FROM t1 LEFT JOIN t2 ON t1_id = t2_id ORDER BY t1_id",
+        "SELECT t1_id, t1_name, t2_name FROM t1 LEFT JOIN t2 ON t2_id = t1_id ORDER BY t1_id",
+    ];
+    let expected = vec![
+        vec!["11", "a", "z"],
+        vec!["22", "b", "y"],
+        vec!["33", "c", "NULL"],
+        vec!["44", "d", "x"],
+        vec!["77", "e", "NULL"],
+    ];
+    for sql in equivalent_sql.iter() {
+        let actual = execute(&mut ctx, sql).await;
+        assert_eq!(expected, actual);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn right_join() -> Result<()> {
     let mut ctx = create_join_context("t1_id", "t2_id")?;
     let equivalent_sql = [
@@ -2066,6 +2087,43 @@ async fn cross_join() {
     assert_eq!(4 * 4 * 2, actual.len());
 }
 
+#[tokio::test]
+async fn cross_join_unbalanced() {
+    // the t1_id is larger than t2_id so the hash_build_probe_order optimizer should kick in
+    let mut ctx = create_join_context_unbalanced("t1_id", "t2_id").unwrap();
+
+    // the order of the values is not determinisitic, so we need to sort to check the values
+    let sql =
+        "SELECT t1_id, t1_name, t2_name FROM t1 CROSS JOIN t2 ORDER BY t1_id, t1_name";
+    let actual = execute(&mut ctx, sql).await;
+
+    assert_eq!(
+        actual,
+        [
+            ["11", "a", "z"],
+            ["11", "a", "y"],
+            ["11", "a", "x"],
+            ["11", "a", "w"],
+            ["22", "b", "z"],
+            ["22", "b", "y"],
+            ["22", "b", "x"],
+            ["22", "b", "w"],
+            ["33", "c", "z"],
+            ["33", "c", "y"],
+            ["33", "c", "x"],
+            ["33", "c", "w"],
+            ["44", "d", "z"],
+            ["44", "d", "y"],
+            ["44", "d", "x"],
+            ["44", "d", "w"],
+            ["77", "e", "z"],
+            ["77", "e", "y"],
+            ["77", "e", "x"],
+            ["77", "e", "w"]
+        ]
+    );
+}
+
 fn create_join_context(
     column_left: &str,
     column_right: &str,
@@ -2151,6 +2209,55 @@ fn create_join_context_qualified() -> Result<ExecutionContext> {
     Ok(ctx)
 }
 
+/// the table column_left has more rows than the table column_right
+fn create_join_context_unbalanced(
+    column_left: &str,
+    column_right: &str,
+) -> Result<ExecutionContext> {
+    let mut ctx = ExecutionContext::new();
+
+    let t1_schema = Arc::new(Schema::new(vec![
+        Field::new(column_left, DataType::UInt32, true),
+        Field::new("t1_name", DataType::Utf8, true),
+    ]));
+    let t1_data = RecordBatch::try_new(
+        t1_schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(vec![11, 22, 33, 44, 77])),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                Some("d"),
+                Some("e"),
+            ])),
+        ],
+    )?;
+    let t1_table = MemTable::try_new(t1_schema, vec![vec![t1_data]])?;
+    ctx.register_table("t1", Arc::new(t1_table))?;
+
+    let t2_schema = Arc::new(Schema::new(vec![
+        Field::new(column_right, DataType::UInt32, true),
+        Field::new("t2_name", DataType::Utf8, true),
+    ]));
+    let t2_data = RecordBatch::try_new(
+        t2_schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(vec![11, 22, 44, 55])),
+            Arc::new(StringArray::from(vec![
+                Some("z"),
+                Some("y"),
+                Some("x"),
+                Some("w"),
+            ])),
+        ],
+    )?;
+    let t2_table = MemTable::try_new(t2_schema, vec![vec![t2_data]])?;
+    ctx.register_table("t2", Arc::new(t2_table))?;
+
+    Ok(ctx)
+}
+
 #[tokio::test]
 async fn csv_explain() {
     // This test uses the execute function that create full plan cycle: logical, optimized logical, and physical,
@@ -2194,12 +2301,10 @@ async fn csv_explain_analyze() {
     let formatted = arrow::util::pretty::pretty_format_batches(&actual).unwrap();
     let formatted = normalize_for_explain(&formatted);
 
-    println!("ANALYZE EXPLAIN:\n{}", formatted);
-
     // Only test basic plumbing and try to avoid having to change too
-    // many things
-    let needle =
-        "CoalescePartitionsExec, metrics=[output_rows=5, elapsed_compute=NOT RECORDED";
+    // many things. explain_analyze_baseline_metrics covers the values
+    // in greater depth
+    let needle = "CoalescePartitionsExec, metrics=[output_rows=5, elapsed_compute=";
     assert_contains!(&formatted, needle);
 
     let verbose_needle = "Output Rows";
@@ -2219,6 +2324,167 @@ async fn csv_explain_analyze_verbose() {
 
     let verbose_needle = "Output Rows";
     assert_contains!(formatted, verbose_needle);
+}
+
+/// A macro to assert that some particular line contains two substrings
+///
+/// Usage: `assert_metrics!(actual, operator_name, metrics)`
+///
+macro_rules! assert_metrics {
+    ($ACTUAL: expr, $OPERATOR_NAME: expr, $METRICS: expr) => {
+        let found = $ACTUAL
+            .lines()
+            .any(|line| line.contains($OPERATOR_NAME) && line.contains($METRICS));
+        assert!(
+            found,
+            "Can not find a line with both '{}' and '{}' in\n\n{}",
+            $OPERATOR_NAME, $METRICS, $ACTUAL
+        );
+    };
+}
+
+#[tokio::test]
+async fn explain_analyze_baseline_metrics() {
+    // This test uses the execute function to run an actual plan under EXPLAIN ANALYZE
+    // and then validate the presence of baseline metrics for supported operators
+    let config = ExecutionConfig::new().with_target_partitions(3);
+    let mut ctx = ExecutionContext::with_config(config);
+    register_aggregate_csv_by_sql(&mut ctx).await;
+    // a query with as many operators as we have metrics for
+    let sql = "EXPLAIN ANALYZE \
+               SELECT count(*) as cnt FROM \
+                 (SELECT count(*), c1 \
+                  FROM aggregate_test_100 \
+                  WHERE c13 != 'C2GT5KVyOPZpgKVl110TyZO0NcJ434' \
+                  GROUP BY c1 \
+                  ORDER BY c1 ) \
+                 UNION ALL \
+               SELECT 1 as cnt \
+                 UNION ALL \
+               SELECT lead(c1, 1) OVER () as cnt FROM (select 1 as c1) \
+               LIMIT 3";
+    println!("running query: {}", sql);
+    let plan = ctx.create_logical_plan(sql).unwrap();
+    let plan = ctx.optimize(&plan).unwrap();
+    let physical_plan = ctx.create_physical_plan(&plan).unwrap();
+    let results = collect(physical_plan.clone()).await.unwrap();
+    let formatted = arrow::util::pretty::pretty_format_batches(&results).unwrap();
+    println!("Query Output:\n\n{}", formatted);
+    let formatted = normalize_for_explain(&formatted);
+
+    assert_metrics!(
+        &formatted,
+        "HashAggregateExec: mode=Partial, gby=[]",
+        "metrics=[output_rows=3, elapsed_compute="
+    );
+    assert_metrics!(
+        &formatted,
+        "HashAggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1]",
+        "metrics=[output_rows=5, elapsed_compute="
+    );
+    assert_metrics!(
+        &formatted,
+        "SortExec: [c1@1 ASC]",
+        "metrics=[output_rows=5, elapsed_compute="
+    );
+    assert_metrics!(
+        &formatted,
+        "FilterExec: c13@1 != C2GT5KVyOPZpgKVl110TyZO0NcJ434",
+        "metrics=[output_rows=99, elapsed_compute="
+    );
+    assert_metrics!(
+        &formatted,
+        "GlobalLimitExec: limit=3, ",
+        "metrics=[output_rows=1, elapsed_compute="
+    );
+    assert_metrics!(
+        &formatted,
+        "LocalLimitExec: limit=3",
+        "metrics=[output_rows=3, elapsed_compute="
+    );
+    assert_metrics!(
+        &formatted,
+        "ProjectionExec: expr=[COUNT(UInt8(1))",
+        "metrics=[output_rows=1, elapsed_compute="
+    );
+    assert_metrics!(
+        &formatted,
+        "CoalesceBatchesExec: target_batch_size=4096",
+        "metrics=[output_rows=5, elapsed_compute"
+    );
+    assert_metrics!(
+        &formatted,
+        "CoalescePartitionsExec",
+        "metrics=[output_rows=5, elapsed_compute="
+    );
+    assert_metrics!(
+        &formatted,
+        "UnionExec",
+        "metrics=[output_rows=3, elapsed_compute="
+    );
+    assert_metrics!(
+        &formatted,
+        "WindowAggExec",
+        "metrics=[output_rows=1, elapsed_compute="
+    );
+
+    fn expected_to_have_metrics(plan: &dyn ExecutionPlan) -> bool {
+        use datafusion::physical_plan;
+
+        plan.as_any().downcast_ref::<physical_plan::sort::SortExec>().is_some()
+            || plan.as_any().downcast_ref::<physical_plan::hash_aggregate::HashAggregateExec>().is_some()
+            // CoalescePartitionsExec doesn't do any work so is not included
+            || plan.as_any().downcast_ref::<physical_plan::filter::FilterExec>().is_some()
+            || plan.as_any().downcast_ref::<physical_plan::limit::GlobalLimitExec>().is_some()
+            || plan.as_any().downcast_ref::<physical_plan::limit::LocalLimitExec>().is_some()
+            || plan.as_any().downcast_ref::<physical_plan::projection::ProjectionExec>().is_some()
+            || plan.as_any().downcast_ref::<physical_plan::coalesce_batches::CoalesceBatchesExec>().is_some()
+            || plan.as_any().downcast_ref::<physical_plan::coalesce_partitions::CoalescePartitionsExec>().is_some()
+            || plan.as_any().downcast_ref::<physical_plan::union::UnionExec>().is_some()
+            || plan.as_any().downcast_ref::<physical_plan::windows::WindowAggExec>().is_some()
+    }
+
+    // Validate that the recorded elapsed compute time was more than
+    // zero for all operators as well as the start/end timestamp are set
+    struct TimeValidator {}
+    impl ExecutionPlanVisitor for TimeValidator {
+        type Error = std::convert::Infallible;
+
+        fn pre_visit(
+            &mut self,
+            plan: &dyn ExecutionPlan,
+        ) -> std::result::Result<bool, Self::Error> {
+            if !expected_to_have_metrics(plan) {
+                return Ok(true);
+            }
+            let metrics = plan.metrics().unwrap().aggregate_by_partition();
+
+            assert!(metrics.output_rows().unwrap() > 0);
+            assert!(metrics.elapsed_compute().unwrap() > 0);
+
+            let mut saw_start = false;
+            let mut saw_end = false;
+            metrics.iter().for_each(|m| match m.value() {
+                MetricValue::StartTimestamp(ts) => {
+                    saw_start = true;
+                    assert!(ts.value().unwrap().timestamp_nanos() > 0);
+                }
+                MetricValue::EndTimestamp(ts) => {
+                    saw_end = true;
+                    assert!(ts.value().unwrap().timestamp_nanos() > 0);
+                }
+                _ => {}
+            });
+
+            assert!(saw_start);
+            assert!(saw_end);
+
+            Ok(true)
+        }
+    }
+
+    datafusion::physical_plan::accept(physical_plan.as_ref(), &mut TimeValidator {})
+        .unwrap();
 }
 
 #[tokio::test]
@@ -2709,6 +2975,17 @@ fn register_alltypes_parquet(ctx: &mut ExecutionContext) {
     ctx.register_parquet(
         "alltypes_plain",
         &format!("{}/alltypes_plain.parquet", testdata),
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "avro")]
+fn register_alltypes_avro(ctx: &mut ExecutionContext) {
+    let testdata = datafusion::test_util::arrow_test_data();
+    ctx.register_avro(
+        "alltypes_plain",
+        &format!("{}/avro/alltypes_plain.avro", testdata),
+        AvroReadOptions::default(),
     )
     .unwrap();
 }
@@ -3794,6 +4071,15 @@ async fn test_string_expressions() -> Result<()> {
     test_expression!("to_hex(9223372036854775807)", "7fffffffffffffff");
     test_expression!("to_hex(CAST(NULL AS int))", "NULL");
     test_expression!("trim(' tom ')", "tom");
+    test_expression!("trim(LEADING ' ' FROM ' tom ')", "tom ");
+    test_expression!("trim(TRAILING ' ' FROM ' tom ')", " tom");
+    test_expression!("trim(BOTH ' ' FROM ' tom ')", "tom");
+    test_expression!("trim(LEADING 'x' FROM 'xxxtomxxx')", "tomxxx");
+    test_expression!("trim(TRAILING 'x' FROM 'xxxtomxxx')", "xxxtom");
+    test_expression!("trim(BOTH 'x' FROM 'xxxtomxx')", "tom");
+    test_expression!("trim(LEADING 'xy' FROM 'xyxabcxyzdefxyx')", "abcxyzdefxyx");
+    test_expression!("trim(TRAILING 'xy' FROM 'xyxabcxyzdefxyx')", "xyxabcxyzdef");
+    test_expression!("trim(BOTH 'xy' FROM 'xyxabcxyzdefxyx')", "abcxyzdef");
     test_expression!("trim(' tom')", "tom");
     test_expression!("trim('')", "");
     test_expression!("trim('tom ')", "tom");
@@ -4188,11 +4474,11 @@ async fn test_physical_plan_display_indent() {
         "GlobalLimitExec: limit=10",
         "  SortExec: [the_min@2 DESC]",
         "    CoalescePartitionsExec",
-        "      ProjectionExec: expr=[c1@0 as c1, MAX(aggregate_test_100.c12)@1 as MAX(c12), MIN(aggregate_test_100.c12)@2 as the_min]",
-        "        HashAggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1], aggr=[MAX(c12), MIN(c12)]",
+        "      ProjectionExec: expr=[c1@0 as c1, MAX(aggregate_test_100.c12)@1 as MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)@2 as the_min]",
+        "        HashAggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1], aggr=[MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)]",
         "          CoalesceBatchesExec: target_batch_size=4096",
         "            RepartitionExec: partitioning=Hash([Column { name: \"c1\", index: 0 }], 3)",
-        "              HashAggregateExec: mode=Partial, gby=[c1@0 as c1], aggr=[MAX(c12), MIN(c12)]",
+        "              HashAggregateExec: mode=Partial, gby=[c1@0 as c1], aggr=[MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)]",
         "                CoalesceBatchesExec: target_batch_size=4096",
         "                  FilterExec: c12@1 < CAST(10 AS Float64)",
         "                    RepartitionExec: partitioning=RoundRobinBatch(3)",
@@ -4366,4 +4652,200 @@ async fn like_on_string_dictionaries() -> Result<()> {
 
     assert_batches_eq!(expected, &actual);
     Ok(())
+}
+
+#[tokio::test]
+async fn test_regexp_is_match() -> Result<()> {
+    let input = vec![Some("foo"), Some("Barrr"), Some("Bazzz"), Some("ZZZZZ")]
+        .into_iter()
+        .collect::<StringArray>();
+
+    let batch = RecordBatch::try_from_iter(vec![("c1", Arc::new(input) as _)]).unwrap();
+
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+    let mut ctx = ExecutionContext::new();
+    ctx.register_table("test", Arc::new(table))?;
+
+    let sql = "SELECT * FROM test WHERE c1 ~ 'z'";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| c1    |",
+        "+-------+",
+        "| Bazzz |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT * FROM test WHERE c1 ~* 'z'";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| c1    |",
+        "+-------+",
+        "| Bazzz |",
+        "| ZZZZZ |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT * FROM test WHERE c1 !~ 'z'";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| c1    |",
+        "+-------+",
+        "| foo   |",
+        "| Barrr |",
+        "| ZZZZZ |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+
+    let sql = "SELECT * FROM test WHERE c1 !~* 'z'";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let expected = vec![
+        "+-------+",
+        "| c1    |",
+        "+-------+",
+        "| foo   |",
+        "| Barrr |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
+
+#[cfg(feature = "avro")]
+#[tokio::test]
+async fn avro_query() {
+    let mut ctx = ExecutionContext::new();
+    register_alltypes_avro(&mut ctx);
+    // NOTE that string_col is actually a binary column and does not have the UTF8 logical type
+    // so we need an explicit cast
+    let sql = "SELECT id, CAST(string_col AS varchar) FROM alltypes_plain";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let expected = vec![
+        "+----+-----------------------------------------+",
+        "| id | CAST(alltypes_plain.string_col AS Utf8) |",
+        "+----+-----------------------------------------+",
+        "| 4  | 0                                       |",
+        "| 5  | 1                                       |",
+        "| 6  | 0                                       |",
+        "| 7  | 1                                       |",
+        "| 2  | 0                                       |",
+        "| 3  | 1                                       |",
+        "| 0  | 0                                       |",
+        "| 1  | 1                                       |",
+        "+----+-----------------------------------------+",
+    ];
+
+    assert_batches_eq!(expected, &actual);
+}
+
+#[cfg(feature = "avro")]
+#[tokio::test]
+async fn avro_query_multiple_files() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let table_path = tempdir.path();
+    let testdata = datafusion::test_util::arrow_test_data();
+    let alltypes_plain_file = format!("{}/avro/alltypes_plain.avro", testdata);
+    std::fs::copy(
+        &alltypes_plain_file,
+        format!("{}/alltypes_plain1.avro", table_path.display()),
+    )
+    .unwrap();
+    std::fs::copy(
+        &alltypes_plain_file,
+        format!("{}/alltypes_plain2.avro", table_path.display()),
+    )
+    .unwrap();
+
+    let mut ctx = ExecutionContext::new();
+    ctx.register_avro(
+        "alltypes_plain",
+        table_path.display().to_string().as_str(),
+        AvroReadOptions::default(),
+    )
+    .unwrap();
+    // NOTE that string_col is actually a binary column and does not have the UTF8 logical type
+    // so we need an explicit cast
+    let sql = "SELECT id, CAST(string_col AS varchar) FROM alltypes_plain";
+    let actual = execute_to_batches(&mut ctx, sql).await;
+    let expected = vec![
+        "+----+-----------------------------------------+",
+        "| id | CAST(alltypes_plain.string_col AS Utf8) |",
+        "+----+-----------------------------------------+",
+        "| 4  | 0                                       |",
+        "| 5  | 1                                       |",
+        "| 6  | 0                                       |",
+        "| 7  | 1                                       |",
+        "| 2  | 0                                       |",
+        "| 3  | 1                                       |",
+        "| 0  | 0                                       |",
+        "| 1  | 1                                       |",
+        "| 4  | 0                                       |",
+        "| 5  | 1                                       |",
+        "| 6  | 0                                       |",
+        "| 7  | 1                                       |",
+        "| 2  | 0                                       |",
+        "| 3  | 1                                       |",
+        "| 0  | 0                                       |",
+        "| 1  | 1                                       |",
+        "+----+-----------------------------------------+",
+    ];
+
+    assert_batches_eq!(expected, &actual);
+}
+
+#[cfg(feature = "avro")]
+#[tokio::test]
+async fn avro_single_nan_schema() {
+    let mut ctx = ExecutionContext::new();
+    let testdata = datafusion::test_util::arrow_test_data();
+    ctx.register_avro(
+        "single_nan",
+        &format!("{}/avro/single_nan.avro", testdata),
+        AvroReadOptions::default(),
+    )
+    .unwrap();
+    let sql = "SELECT mycol FROM single_nan";
+    let plan = ctx.create_logical_plan(sql).unwrap();
+    let plan = ctx.optimize(&plan).unwrap();
+    let plan = ctx.create_physical_plan(&plan).unwrap();
+    let results = collect(plan).await.unwrap();
+    for batch in results {
+        assert_eq!(1, batch.num_rows());
+        assert_eq!(1, batch.num_columns());
+    }
+}
+
+#[cfg(feature = "avro")]
+#[tokio::test]
+async fn avro_explain() {
+    let mut ctx = ExecutionContext::new();
+    register_alltypes_avro(&mut ctx);
+
+    let sql = "EXPLAIN SELECT count(*) from alltypes_plain";
+    let actual = execute(&mut ctx, sql).await;
+    let actual = normalize_vec_for_explain(actual);
+    let expected = vec![
+        vec![
+            "logical_plan",
+            "Projection: #COUNT(UInt8(1))\
+            \n  Aggregate: groupBy=[[]], aggr=[[COUNT(UInt8(1))]]\
+            \n    TableScan: alltypes_plain projection=Some([0])",
+        ],
+        vec![
+            "physical_plan",
+            "ProjectionExec: expr=[COUNT(UInt8(1))@0 as COUNT(UInt8(1))]\
+            \n  HashAggregateExec: mode=Final, gby=[], aggr=[COUNT(UInt8(1))]\
+            \n    CoalescePartitionsExec\
+            \n      HashAggregateExec: mode=Partial, gby=[], aggr=[COUNT(UInt8(1))]\
+            \n        RepartitionExec: partitioning=RoundRobinBatch(NUM_CORES)\
+            \n          AvroExec: source=Path(ARROW_TEST_DATA/avro/alltypes_plain.avro: [ARROW_TEST_DATA/avro/alltypes_plain.avro]), batch_size=8192, limit=None\
+            \n",
+        ],
+    ];
+    assert_eq!(expected, actual);
 }

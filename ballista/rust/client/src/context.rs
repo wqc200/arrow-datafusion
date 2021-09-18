@@ -32,6 +32,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::dataframe_impl::DataFrameImpl;
 use datafusion::logical_plan::LogicalPlan;
+use datafusion::physical_plan::avro::AvroReadOptions;
 use datafusion::physical_plan::csv::CsvReadOptions;
 use datafusion::sql::parser::FileType;
 
@@ -65,7 +66,9 @@ impl BallistaContextState {
         config: &BallistaConfig,
         concurrent_tasks: usize,
     ) -> ballista_core::error::Result<Self> {
-        info!("Running in local mode. Scheduler will be run in-proc");
+        use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
+
+        log::info!("Running in local mode. Scheduler will be run in-proc");
 
         let addr = ballista_scheduler::new_standalone_scheduler().await?;
 
@@ -77,8 +80,8 @@ impl BallistaContextState {
             .await
             {
                 Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    info!("Attempting to connect to in-proc scheduler...");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    log::info!("Attempting to connect to in-proc scheduler...");
                 }
                 Ok(scheduler) => break scheduler,
             }
@@ -123,6 +126,30 @@ impl BallistaContext {
         Ok(Self {
             state: Arc::new(Mutex::new(state)),
         })
+    }
+
+    /// Create a DataFrame representing an Avro table scan
+
+    pub fn read_avro(
+        &self,
+        path: &str,
+        options: AvroReadOptions,
+    ) -> Result<Arc<dyn DataFrame>> {
+        // convert to absolute path because the executor likely has a different working directory
+        let path = PathBuf::from(path);
+        let path = fs::canonicalize(&path)?;
+
+        // use local DataFusion context for now but later this might call the scheduler
+        let mut ctx = {
+            let guard = self.state.lock().unwrap();
+            create_df_ctx_with_ballista_query_planner(
+                &guard.scheduler_host,
+                guard.scheduler_port,
+                guard.config(),
+            )
+        };
+        let df = ctx.read_avro(path.to_str().unwrap(), options)?;
+        Ok(df)
     }
 
     /// Create a DataFrame representing a Parquet table scan
@@ -193,6 +220,17 @@ impl BallistaContext {
         self.register_table(name, df.as_ref())
     }
 
+    pub fn register_avro(
+        &self,
+        name: &str,
+        path: &str,
+        options: AvroReadOptions,
+    ) -> Result<()> {
+        let df = self.read_avro(path, options)?;
+        self.register_table(name, df.as_ref())?;
+        Ok(())
+    }
+
     /// Create a DataFrame from a SQL statement
     pub fn sql(&self, sql: &str) -> Result<Arc<dyn DataFrame>> {
         let mut ctx = {
@@ -240,6 +278,10 @@ impl BallistaContext {
                     self.register_parquet(name, location)?;
                     Ok(Arc::new(DataFrameImpl::new(ctx.state, &plan)))
                 }
+                FileType::Avro => {
+                    self.register_avro(name, location, AvroReadOptions::default())?;
+                    Ok(Arc::new(DataFrameImpl::new(ctx.state, &plan)))
+                }
                 _ => Err(DataFusionError::NotImplemented(format!(
                     "Unsupported file type {:?}.",
                     file_type
@@ -257,8 +299,10 @@ mod tests {
     #[cfg(feature = "standalone")]
     async fn test_standalone_mode() {
         use super::*;
-        let context = BallistaContext::standalone(1).await.unwrap();
+        let context = BallistaContext::standalone(&BallistaConfig::new().unwrap(), 1)
+            .await
+            .unwrap();
         let df = context.sql("SELECT 1;").unwrap();
-        context.collect(&df.to_logical_plan()).await.unwrap();
+        df.collect().await.unwrap();
     }
 }

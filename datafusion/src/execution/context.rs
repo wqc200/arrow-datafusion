@@ -22,11 +22,11 @@ use crate::{
         information_schema::CatalogWithInformationSchema,
     },
     logical_plan::{PlanType, ToStringifiedPlan},
-    optimizer::{
-        aggregate_statistics::AggregateStatistics, eliminate_limit::EliminateLimit,
-        hash_build_probe_order::HashBuildProbeOrder,
+    optimizer::eliminate_limit::EliminateLimit,
+    physical_optimizer::{
+        aggregate_statistics::AggregateStatistics,
+        hash_build_probe_order::HashBuildProbeOrder, optimizer::PhysicalOptimizerRule,
     },
-    physical_optimizer::optimizer::PhysicalOptimizerRule,
 };
 use log::debug;
 use std::fs;
@@ -49,6 +49,7 @@ use crate::catalog::{
     ResolvedTableReference, TableReference,
 };
 use crate::datasource::csv::CsvFile;
+use crate::datasource::object_store::{ObjectStore, ObjectStoreRegistry};
 use crate::datasource::parquet::ParquetTable;
 use crate::datasource::TableProvider;
 use crate::error::{DataFusionError, Result};
@@ -56,6 +57,7 @@ use crate::execution::dataframe_impl::DataFrameImpl;
 use crate::logical_plan::{
     FunctionRegistry, LogicalPlan, LogicalPlanBuilder, UNNAMED_TABLE,
 };
+use crate::optimizer::common_subexpr_eliminate::CommonSubexprEliminate;
 use crate::optimizer::constant_folding::ConstantFolding;
 use crate::optimizer::filter_push_down::FilterPushDown;
 use crate::optimizer::limit_push_down::LimitPushDown;
@@ -66,6 +68,8 @@ use crate::physical_optimizer::coalesce_batches::CoalesceBatches;
 use crate::physical_optimizer::merge_exec::AddCoalescePartitionsExec;
 use crate::physical_optimizer::repartition::Repartition;
 
+use crate::datasource::avro::AvroFile;
+use crate::physical_plan::avro::AvroReadOptions;
 use crate::physical_plan::csv::CsvReadOptions;
 use crate::physical_plan::planner::DefaultPhysicalPlanner;
 use crate::physical_plan::udf::ScalarUDF;
@@ -164,6 +168,7 @@ impl ExecutionContext {
                 aggregate_functions: HashMap::new(),
                 config,
                 execution_props: ExecutionProps::new(),
+                object_store_registry: Arc::new(ObjectStoreRegistry::new()),
             })),
         }
     }
@@ -192,6 +197,11 @@ impl ExecutionContext {
                 }
                 FileType::Parquet => {
                     self.register_parquet(name, location)?;
+                    let plan = LogicalPlanBuilder::empty(false).build()?;
+                    Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
+                }
+                FileType::Avro => {
+                    self.register_avro(name, location, AvroReadOptions::default())?;
                     let plan = LogicalPlanBuilder::empty(false).build()?;
                     Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
                 }
@@ -269,6 +279,19 @@ impl ExecutionContext {
             .insert(f.name.clone(), Arc::new(f));
     }
 
+    /// Creates a DataFrame for reading an Avro data source.
+
+    pub fn read_avro(
+        &mut self,
+        filename: impl Into<String>,
+        options: AvroReadOptions,
+    ) -> Result<Arc<dyn DataFrame>> {
+        Ok(Arc::new(DataFrameImpl::new(
+            self.state.clone(),
+            &LogicalPlanBuilder::scan_avro(filename, options, None)?.build()?,
+        )))
+    }
+
     /// Creates a DataFrame for reading a CSV data source.
     pub fn read_csv(
         &mut self,
@@ -332,6 +355,18 @@ impl ExecutionContext {
         Ok(())
     }
 
+    /// Registers an Avro data source so that it can be referenced from SQL statements
+    /// executed against this context.
+    pub fn register_avro(
+        &mut self,
+        name: &str,
+        filename: &str,
+        options: AvroReadOptions,
+    ) -> Result<()> {
+        self.register_table(name, Arc::new(AvroFile::try_new(filename, options)?))?;
+        Ok(())
+    }
+
     /// Registers a named catalog using a custom `CatalogProvider` so that
     /// it can be referenced from SQL statements executed against this
     /// context.
@@ -361,6 +396,29 @@ impl ExecutionContext {
     /// Retrieves a `CatalogProvider` instance by name
     pub fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
         self.state.lock().unwrap().catalog_list.catalog(name)
+    }
+
+    /// Registers a object store with scheme using a custom `ObjectStore` so that
+    /// an external file system or object storage system could be used against this context.
+    ///
+    /// Returns the `ObjectStore` previously registered for this scheme, if any
+    pub fn register_object_store(
+        &self,
+        scheme: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Option<Arc<dyn ObjectStore>> {
+        let scheme = scheme.into();
+
+        self.state
+            .lock()
+            .unwrap()
+            .object_store_registry
+            .register_store(scheme, object_store)
+    }
+
+    /// Retrieves a `ObjectStore` instance by scheme
+    pub fn object_store(&self, scheme: &str) -> Option<Arc<dyn ObjectStore>> {
+        self.state.lock().unwrap().object_store_registry.get(scheme)
     }
 
     /// Registers a table using a custom `TableProvider` so that
@@ -695,15 +753,16 @@ impl Default for ExecutionConfig {
             batch_size: 8192,
             optimizers: vec![
                 Arc::new(ConstantFolding::new()),
+                Arc::new(CommonSubexprEliminate::new()),
                 Arc::new(EliminateLimit::new()),
-                Arc::new(AggregateStatistics::new()),
                 Arc::new(ProjectionPushDown::new()),
                 Arc::new(FilterPushDown::new()),
                 Arc::new(SimplifyExpressions::new()),
-                Arc::new(HashBuildProbeOrder::new()),
                 Arc::new(LimitPushDown::new()),
             ],
             physical_optimizers: vec![
+                Arc::new(AggregateStatistics::new()),
+                Arc::new(HashBuildProbeOrder::new()),
                 Arc::new(CoalesceBatches::new()),
                 Arc::new(Repartition::new()),
                 Arc::new(AddCoalescePartitionsExec::new()),
@@ -860,6 +919,8 @@ pub struct ExecutionContextState {
     pub config: ExecutionConfig,
     /// Execution properties
     pub execution_props: ExecutionProps,
+    /// Object Store that are registered with the context
+    pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl ExecutionProps {
@@ -887,6 +948,7 @@ impl ExecutionContextState {
             aggregate_functions: HashMap::new(),
             config: ExecutionConfig::new(),
             execution_props: ExecutionProps::new(),
+            object_store_registry: Arc::new(ObjectStoreRegistry::new()),
         }
     }
 
@@ -971,6 +1033,7 @@ impl FunctionRegistry for ExecutionContextState {
 mod tests {
 
     use super::*;
+    use crate::logical_plan::{binary_expr, lit, Operator};
     use crate::physical_plan::functions::make_scalar_function;
     use crate::physical_plan::{collect, collect_partitioned};
     use crate::test;
@@ -1504,15 +1567,15 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+----+----+---------+-----------+---------+---------+---------+",
-            "| c1 | c2 | SUM(c2) | COUNT(c2) | MAX(c2) | MIN(c2) | AVG(c2) |",
-            "+----+----+---------+-----------+---------+---------+---------+",
-            "| 0  | 1  | 220     | 40        | 10      | 1       | 5.5     |",
-            "| 0  | 2  | 220     | 40        | 10      | 1       | 5.5     |",
-            "| 0  | 3  | 220     | 40        | 10      | 1       | 5.5     |",
-            "| 0  | 4  | 220     | 40        | 10      | 1       | 5.5     |",
-            "| 0  | 5  | 220     | 40        | 10      | 1       | 5.5     |",
-            "+----+----+---------+-----------+---------+---------+---------+",
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
+            "| c1 | c2 | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
+            "| 0  | 1  | 220          | 40             | 10           | 1            | 5.5          |",
+            "| 0  | 2  | 220          | 40             | 10           | 1            | 5.5          |",
+            "| 0  | 3  | 220          | 40             | 10           | 1            | 5.5          |",
+            "| 0  | 4  | 220          | 40             | 10           | 1            | 5.5          |",
+            "| 0  | 5  | 220          | 40             | 10           | 1            | 5.5          |",
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
         ];
 
         // window function shall respect ordering
@@ -1547,15 +1610,15 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+----+----+--------------+-----------------+----------------+------------------------+---------+-----------+---------+---------+---------+",
-            "| c1 | c2 | ROW_NUMBER() | FIRST_VALUE(c2) | LAST_VALUE(c2) | NTH_VALUE(c2,Int64(2)) | SUM(c2) | COUNT(c2) | MAX(c2) | MIN(c2) | AVG(c2) |",
-            "+----+----+--------------+-----------------+----------------+------------------------+---------+-----------+---------+---------+---------+",
-            "| 0  | 1  | 1            | 1               | 1              |                        | 1       | 1         | 1       | 1       | 1       |",
-            "| 0  | 2  | 2            | 1               | 2              | 2                      | 3       | 2         | 2       | 1       | 1.5     |",
-            "| 0  | 3  | 3            | 1               | 3              | 2                      | 6       | 3         | 3       | 1       | 2       |",
-            "| 0  | 4  | 4            | 1               | 4              | 2                      | 10      | 4         | 4       | 1       | 2.5     |",
-            "| 0  | 5  | 5            | 1               | 5              | 2                      | 15      | 5         | 5       | 1       | 3       |",
-            "+----+----+--------------+-----------------+----------------+------------------------+---------+-----------+---------+---------+---------+",
+            "+----+----+--------------+----------------------+---------------------+-----------------------------+--------------+----------------+--------------+--------------+--------------+",
+            "| c1 | c2 | ROW_NUMBER() | FIRST_VALUE(test.c2) | LAST_VALUE(test.c2) | NTH_VALUE(test.c2,Int64(2)) | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
+            "+----+----+--------------+----------------------+---------------------+-----------------------------+--------------+----------------+--------------+--------------+--------------+",
+            "| 0  | 1  | 1            | 1                    | 1                   |                             | 1            | 1              | 1            | 1            | 1            |",
+            "| 0  | 2  | 2            | 1                    | 2                   | 2                           | 3            | 2              | 2            | 1            | 1.5          |",
+            "| 0  | 3  | 3            | 1                    | 3                   | 2                           | 6            | 3              | 3            | 1            | 2            |",
+            "| 0  | 4  | 4            | 1                    | 4                   | 2                           | 10           | 4              | 4            | 1            | 2.5          |",
+            "| 0  | 5  | 5            | 1                    | 5                   | 2                           | 15           | 5              | 5            | 1            | 3            |",
+            "+----+----+--------------+----------------------+---------------------+-----------------------------+--------------+----------------+--------------+--------------+--------------+",
         ];
 
         // window function shall respect ordering
@@ -1582,15 +1645,15 @@ mod tests {
         .await?;
 
         let expected = vec![
-            "+----+----+---------+-----------+---------+---------+---------+",
-            "| c1 | c2 | SUM(c2) | COUNT(c2) | MAX(c2) | MIN(c2) | AVG(c2) |",
-            "+----+----+---------+-----------+---------+---------+---------+",
-            "| 0  | 1  | 4       | 4         | 1       | 1       | 1       |",
-            "| 0  | 2  | 8       | 4         | 2       | 2       | 2       |",
-            "| 0  | 3  | 12      | 4         | 3       | 3       | 3       |",
-            "| 0  | 4  | 16      | 4         | 4       | 4       | 4       |",
-            "| 0  | 5  | 20      | 4         | 5       | 5       | 5       |",
-            "+----+----+---------+-----------+---------+---------+---------+",
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
+            "| c1 | c2 | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
+            "| 0  | 1  | 4            | 4              | 1            | 1            | 1            |",
+            "| 0  | 2  | 8            | 4              | 2            | 2            | 2            |",
+            "| 0  | 3  | 12           | 4              | 3            | 3            | 3            |",
+            "| 0  | 4  | 16           | 4              | 4            | 4            | 4            |",
+            "| 0  | 5  | 20           | 4              | 5            | 5            | 5            |",
+            "+----+----+--------------+----------------+--------------+--------------+--------------+",
         ];
 
         // window function shall respect ordering
@@ -1621,15 +1684,15 @@ mod tests {
         .await?;
 
         let expected = vec![
-            "+----+----+--------------+-------------------------+------------------------+--------------------------------+---------+-----------+---------+---------+---------+",
-            "| c1 | c2 | ROW_NUMBER() | FIRST_VALUE(c2 Plus c1) | LAST_VALUE(c2 Plus c1) | NTH_VALUE(c2 Plus c1,Int64(1)) | SUM(c2) | COUNT(c2) | MAX(c2) | MIN(c2) | AVG(c2) |",
-            "+----+----+--------------+-------------------------+------------------------+--------------------------------+---------+-----------+---------+---------+---------+",
-            "| 0  | 1  | 1            | 1                       | 1                      | 1                              | 1       | 1         | 1       | 1       | 1       |",
-            "| 0  | 2  | 1            | 2                       | 2                      | 2                              | 2       | 1         | 2       | 2       | 2       |",
-            "| 0  | 3  | 1            | 3                       | 3                      | 3                              | 3       | 1         | 3       | 3       | 3       |",
-            "| 0  | 4  | 1            | 4                       | 4                      | 4                              | 4       | 1         | 4       | 4       | 4       |",
-            "| 0  | 5  | 1            | 5                       | 5                      | 5                              | 5       | 1         | 5       | 5       | 5       |",
-            "+----+----+--------------+-------------------------+------------------------+--------------------------------+---------+-----------+---------+---------+---------+",
+            "+----+----+--------------+-----------------------------------+----------------------------------+------------------------------------------+--------------+----------------+--------------+--------------+--------------+",
+            "| c1 | c2 | ROW_NUMBER() | FIRST_VALUE(test.c2 Plus test.c1) | LAST_VALUE(test.c2 Plus test.c1) | NTH_VALUE(test.c2 Plus test.c1,Int64(1)) | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
+            "+----+----+--------------+-----------------------------------+----------------------------------+------------------------------------------+--------------+----------------+--------------+--------------+--------------+",
+            "| 0  | 1  | 1            | 1                                 | 1                                | 1                                        | 1            | 1              | 1            | 1            | 1            |",
+            "| 0  | 2  | 1            | 2                                 | 2                                | 2                                        | 2            | 1              | 2            | 2            | 2            |",
+            "| 0  | 3  | 1            | 3                                 | 3                                | 3                                        | 3            | 1              | 3            | 3            | 3            |",
+            "| 0  | 4  | 1            | 4                                 | 4                                | 4                                        | 4            | 1              | 4            | 4            | 4            |",
+            "| 0  | 5  | 1            | 5                                 | 5                                | 5                                        | 5            | 1              | 5            | 5            | 5            |",
+            "+----+----+--------------+-----------------------------------+----------------------------------+------------------------------------------+--------------+----------------+--------------+--------------+--------------+",
         ];
 
         // window function shall respect ordering
@@ -1643,11 +1706,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+---------+---------+",
-            "| SUM(c1) | SUM(c2) |",
-            "+---------+---------+",
-            "| 60      | 220     |",
-            "+---------+---------+",
+            "+--------------+--------------+",
+            "| SUM(test.c1) | SUM(test.c2) |",
+            "+--------------+--------------+",
+            "| 60           | 220          |",
+            "+--------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1664,11 +1727,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+---------+---------+",
-            "| SUM(c1) | SUM(c2) |",
-            "+---------+---------+",
-            "|         |         |",
-            "+---------+---------+",
+            "+--------------+--------------+",
+            "| SUM(test.c1) | SUM(test.c2) |",
+            "+--------------+--------------+",
+            "|              |              |",
+            "+--------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1681,11 +1744,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+---------+---------+",
-            "| AVG(c1) | AVG(c2) |",
-            "+---------+---------+",
-            "| 1.5     | 5.5     |",
-            "+---------+---------+",
+            "+--------------+--------------+",
+            "| AVG(test.c1) | AVG(test.c2) |",
+            "+--------------+--------------+",
+            "| 1.5          | 5.5          |",
+            "+--------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1698,11 +1761,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+---------+---------+",
-            "| MAX(c1) | MAX(c2) |",
-            "+---------+---------+",
-            "| 3       | 10      |",
-            "+---------+---------+",
+            "+--------------+--------------+",
+            "| MAX(test.c1) | MAX(test.c2) |",
+            "+--------------+--------------+",
+            "| 3            | 10           |",
+            "+--------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1715,11 +1778,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+---------+---------+",
-            "| MIN(c1) | MIN(c2) |",
-            "+---------+---------+",
-            "| 0       | 1       |",
-            "+---------+---------+",
+            "+--------------+--------------+",
+            "| MIN(test.c1) | MIN(test.c2) |",
+            "+--------------+--------------+",
+            "| 0            | 1            |",
+            "+--------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1731,14 +1794,14 @@ mod tests {
         let results = execute("SELECT c1, SUM(c2) FROM test GROUP BY c1", 4).await?;
 
         let expected = vec![
-            "+----+---------+",
-            "| c1 | SUM(c2) |",
-            "+----+---------+",
-            "| 0  | 55      |",
-            "| 1  | 55      |",
-            "| 2  | 55      |",
-            "| 3  | 55      |",
-            "+----+---------+",
+            "+----+--------------+",
+            "| c1 | SUM(test.c2) |",
+            "+----+--------------+",
+            "| 0  | 55           |",
+            "| 1  | 55           |",
+            "| 2  | 55           |",
+            "| 3  | 55           |",
+            "+----+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1750,14 +1813,14 @@ mod tests {
         let results = execute("SELECT c1, AVG(c2) FROM test GROUP BY c1", 4).await?;
 
         let expected = vec![
-            "+----+---------+",
-            "| c1 | AVG(c2) |",
-            "+----+---------+",
-            "| 0  | 5.5     |",
-            "| 1  | 5.5     |",
-            "| 2  | 5.5     |",
-            "| 3  | 5.5     |",
-            "+----+---------+",
+            "+----+--------------+",
+            "| c1 | AVG(test.c2) |",
+            "+----+--------------+",
+            "| 0  | 5.5          |",
+            "| 1  | 5.5          |",
+            "| 2  | 5.5          |",
+            "| 3  | 5.5          |",
+            "+----+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1801,14 +1864,14 @@ mod tests {
         let results = execute("SELECT c1, MAX(c2) FROM test GROUP BY c1", 4).await?;
 
         let expected = vec![
-            "+----+---------+",
-            "| c1 | MAX(c2) |",
-            "+----+---------+",
-            "| 0  | 10      |",
-            "| 1  | 10      |",
-            "| 2  | 10      |",
-            "| 3  | 10      |",
-            "+----+---------+",
+            "+----+--------------+",
+            "| c1 | MAX(test.c2) |",
+            "+----+--------------+",
+            "| 0  | 10           |",
+            "| 1  | 10           |",
+            "| 2  | 10           |",
+            "| 3  | 10           |",
+            "+----+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1820,14 +1883,14 @@ mod tests {
         let results = execute("SELECT c1, MIN(c2) FROM test GROUP BY c1", 4).await?;
 
         let expected = vec![
-            "+----+---------+",
-            "| c1 | MIN(c2) |",
-            "+----+---------+",
-            "| 0  | 1       |",
-            "| 1  | 1       |",
-            "| 2  | 1       |",
-            "| 3  | 1       |",
-            "+----+---------+",
+            "+----+--------------+",
+            "| c1 | MIN(test.c2) |",
+            "+----+--------------+",
+            "| 0  | 1            |",
+            "| 1  | 1            |",
+            "| 2  | 1            |",
+            "| 3  | 1            |",
+            "+----+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1868,11 +1931,11 @@ mod tests {
         .unwrap();
 
         let expected = vec![
-            "+--------------+---------------+---------------+-------------+",
-            "| COUNT(nanos) | COUNT(micros) | COUNT(millis) | COUNT(secs) |",
-            "+--------------+---------------+---------------+-------------+",
-            "| 3            | 3             | 3             | 3           |",
-            "+--------------+---------------+---------------+-------------+",
+            "+----------------+-----------------+-----------------+---------------+",
+            "| COUNT(t.nanos) | COUNT(t.micros) | COUNT(t.millis) | COUNT(t.secs) |",
+            "+----------------+-----------------+-----------------+---------------+",
+            "| 3              | 3               | 3               | 3             |",
+            "+----------------+-----------------+-----------------+---------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -1895,7 +1958,7 @@ mod tests {
 
         let expected = vec![
             "+----------------------------+----------------------------+-------------------------+---------------------+",
-            "| MIN(nanos)                 | MIN(micros)                | MIN(millis)             | MIN(secs)           |",
+            "| MIN(t.nanos)               | MIN(t.micros)              | MIN(t.millis)           | MIN(t.secs)         |",
             "+----------------------------+----------------------------+-------------------------+---------------------+",
             "| 2011-12-13 11:13:10.123450 | 2011-12-13 11:13:10.123450 | 2011-12-13 11:13:10.123 | 2011-12-13 11:13:10 |",
             "+----------------------------+----------------------------+-------------------------+---------------------+",
@@ -1921,7 +1984,7 @@ mod tests {
 
         let expected = vec![
             "+-------------------------+-------------------------+-------------------------+---------------------+",
-            "| MAX(nanos)              | MAX(micros)             | MAX(millis)             | MAX(secs)           |",
+            "| MAX(t.nanos)            | MAX(t.micros)           | MAX(t.millis)           | MAX(t.secs)         |",
             "+-------------------------+-------------------------+-------------------------+---------------------+",
             "| 2021-01-01 05:11:10.432 | 2021-01-01 05:11:10.432 | 2021-01-01 05:11:10.432 | 2021-01-01 05:11:10 |",
             "+-------------------------+-------------------------+-------------------------+---------------------+",
@@ -1950,6 +2013,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_avg_add() -> Result<()> {
+        let results = execute(
+            "SELECT AVG(c1), AVG(c1) + 1, AVG(c1) + 2, 1 + AVG(c1) FROM test",
+            4,
+        )
+        .await?;
+        assert_eq!(results.len(), 1);
+
+        let expected = vec![
+            "+--------------+----------------------------+----------------------------+----------------------------+",
+            "| AVG(test.c1) | AVG(test.c1) Plus Int64(1) | AVG(test.c1) Plus Int64(2) | Int64(1) Plus AVG(test.c1) |",
+            "+--------------+----------------------------+----------------------------+----------------------------+",
+            "| 1.5          | 2.5                        | 3.5                        | 2.5                        |",
+            "+--------------+----------------------------+----------------------------+----------------------------+",
+        ];
+        assert_batches_sorted_eq!(expected, &results);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn join_partitioned() -> Result<()> {
         // self join on partition id (workaround for duplicate column name)
         let results = execute(
@@ -1972,11 +2056,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+-----------+-----------+",
-            "| COUNT(c1) | COUNT(c2) |",
-            "+-----------+-----------+",
-            "| 10        | 10        |",
-            "+-----------+-----------+",
+            "+----------------+----------------+",
+            "| COUNT(test.c1) | COUNT(test.c2) |",
+            "+----------------+----------------+",
+            "| 10             | 10             |",
+            "+----------------+----------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
         Ok(())
@@ -1988,11 +2072,11 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         let expected = vec![
-            "+-----------+-----------+",
-            "| COUNT(c1) | COUNT(c2) |",
-            "+-----------+-----------+",
-            "| 40        | 40        |",
-            "+-----------+-----------+",
+            "+----------------+----------------+",
+            "| COUNT(test.c1) | COUNT(test.c2) |",
+            "+----------------+----------------+",
+            "| 40             | 40             |",
+            "+----------------+----------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
         Ok(())
@@ -2003,14 +2087,14 @@ mod tests {
         let results = execute("SELECT c1, COUNT(c2) FROM test GROUP BY c1", 4).await?;
 
         let expected = vec![
-            "+----+-----------+",
-            "| c1 | COUNT(c2) |",
-            "+----+-----------+",
-            "| 0  | 10        |",
-            "| 1  | 10        |",
-            "| 2  | 10        |",
-            "| 3  | 10        |",
-            "+----+-----------+",
+            "+----+----------------+",
+            "| c1 | COUNT(test.c2) |",
+            "+----+----------------+",
+            "| 0  | 10             |",
+            "| 1  | 10             |",
+            "| 2  | 10             |",
+            "| 3  | 10             |",
+            "+----+----------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
         Ok(())
@@ -2054,12 +2138,12 @@ mod tests {
         ).await?;
 
         let expected = vec![
-            "+---------------------+---------+",
-            "| week                | SUM(c2) |",
-            "+---------------------+---------+",
-            "| 2020-12-07 00:00:00 | 24      |",
-            "| 2020-12-14 00:00:00 | 156     |",
-            "+---------------------+---------+",
+            "+---------------------+--------------+",
+            "| week                | SUM(test.c2) |",
+            "+---------------------+--------------+",
+            "| 2020-12-07 00:00:00 | 24           |",
+            "| 2020-12-14 00:00:00 | 156          |",
+            "+---------------------+--------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -2105,16 +2189,40 @@ mod tests {
                     .expect("ran plan correctly");
 
             let expected = vec![
-                "+-----+------------+",
-                "| str | COUNT(val) |",
-                "+-----+------------+",
-                "| A   | 4          |",
-                "| B   | 1          |",
-                "| C   | 1          |",
-                "+-----+------------+",
+                "+-----+--------------+",
+                "| str | COUNT(t.val) |",
+                "+-----+--------------+",
+                "| A   | 4            |",
+                "| B   | 1            |",
+                "| C   | 1            |",
+                "+-----+--------------+",
             ];
             assert_batches_sorted_eq!(expected, &results);
         }
+    }
+
+    #[tokio::test]
+    async fn unprojected_filter() {
+        let mut ctx = ExecutionContext::new();
+        let df = ctx
+            .read_table(test::table_with_sequence(1, 3).unwrap())
+            .unwrap();
+
+        let df = df
+            .select(vec![binary_expr(col("i"), Operator::Plus, col("i"))])
+            .unwrap()
+            .filter(col("i").gt(lit(2)))
+            .unwrap();
+        let results = df.collect().await.unwrap();
+
+        let expected = vec![
+            "+--------------------------+",
+            "| ?table?.i Plus ?table?.i |",
+            "+--------------------------+",
+            "| 6                        |",
+            "+--------------------------+",
+        ];
+        assert_batches_sorted_eq!(expected, &results);
     }
 
     #[tokio::test]
@@ -2156,13 +2264,13 @@ mod tests {
             .expect("ran plan correctly");
 
             let expected = vec![
-                "+------+------------+",
-                "| dict | COUNT(val) |",
-                "+------+------------+",
-                "| A    | 4          |",
-                "| B    | 1          |",
-                "| C    | 1          |",
-                "+------+------------+",
+                "+------+--------------+",
+                "| dict | COUNT(t.val) |",
+                "+------+--------------+",
+                "| A    | 4            |",
+                "| B    | 1            |",
+                "| C    | 1            |",
+                "+------+--------------+",
             ];
             assert_batches_sorted_eq!(expected, &results);
 
@@ -2173,13 +2281,13 @@ mod tests {
                     .expect("ran plan correctly");
 
             let expected = vec![
-                "+-----+-------------+",
-                "| val | COUNT(dict) |",
-                "+-----+-------------+",
-                "| 1   | 3           |",
-                "| 2   | 2           |",
-                "| 4   | 1           |",
-                "+-----+-------------+",
+                "+-----+---------------+",
+                "| val | COUNT(t.dict) |",
+                "+-----+---------------+",
+                "| 1   | 3             |",
+                "| 2   | 2             |",
+                "| 4   | 1             |",
+                "+-----+---------------+",
             ];
             assert_batches_sorted_eq!(expected, &results);
 
@@ -2192,13 +2300,13 @@ mod tests {
             .expect("ran plan correctly");
 
             let expected = vec![
-                "+-----+----------------------+",
-                "| val | COUNT(DISTINCT dict) |",
-                "+-----+----------------------+",
-                "| 1   | 2                    |",
-                "| 2   | 2                    |",
-                "| 4   | 1                    |",
-                "+-----+----------------------+",
+                "+-----+------------------------+",
+                "| val | COUNT(DISTINCT t.dict) |",
+                "+-----+------------------------+",
+                "| 1   | 2                      |",
+                "| 2   | 2                      |",
+                "| 4   | 1                      |",
+                "+-----+------------------------+",
             ];
             assert_batches_sorted_eq!(expected, &results);
         }
@@ -2297,13 +2405,13 @@ mod tests {
         let results = run_count_distinct_integers_aggregated_scenario(partitions).await?;
 
         let expected = vec![
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
-            "| c_group | COUNT(c_uint64) | COUNT(DISTINCT c_int8) | COUNT(DISTINCT c_int16) | COUNT(DISTINCT c_int32) | COUNT(DISTINCT c_int64) | COUNT(DISTINCT c_uint8) | COUNT(DISTINCT c_uint16) | COUNT(DISTINCT c_uint32) | COUNT(DISTINCT c_uint64) |",
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
-            "| a       | 3               | 2                      | 2                       | 2                       | 2                       | 2                       | 2                        | 2                        | 2                        |",
-            "| b       | 1               | 1                      | 1                       | 1                       | 1                       | 1                       | 1                        | 1                        | 1                        |",
-            "| c       | 3               | 2                      | 2                       | 2                       | 2                       | 2                       | 2                        | 2                        | 2                        |",
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
+            "| c_group | COUNT(test.c_uint64) | COUNT(DISTINCT test.c_int8) | COUNT(DISTINCT test.c_int16) | COUNT(DISTINCT test.c_int32) | COUNT(DISTINCT test.c_int64) | COUNT(DISTINCT test.c_uint8) | COUNT(DISTINCT test.c_uint16) | COUNT(DISTINCT test.c_uint32) | COUNT(DISTINCT test.c_uint64) |",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
+            "| a       | 3                    | 2                           | 2                            | 2                            | 2                            | 2                            | 2                             | 2                             | 2                             |",
+            "| b       | 1                    | 1                           | 1                            | 1                            | 1                            | 1                            | 1                             | 1                             | 1                             |",
+            "| c       | 3                    | 2                           | 2                            | 2                            | 2                            | 2                            | 2                             | 2                             | 2                             |",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -2323,13 +2431,13 @@ mod tests {
         let results = run_count_distinct_integers_aggregated_scenario(partitions).await?;
 
         let expected = vec![
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
-            "| c_group | COUNT(c_uint64) | COUNT(DISTINCT c_int8) | COUNT(DISTINCT c_int16) | COUNT(DISTINCT c_int32) | COUNT(DISTINCT c_int64) | COUNT(DISTINCT c_uint8) | COUNT(DISTINCT c_uint16) | COUNT(DISTINCT c_uint32) | COUNT(DISTINCT c_uint64) |",
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
-            "| a       | 5               | 3                      | 3                       | 3                       | 3                       | 3                       | 3                        | 3                        | 3                        |",
-            "| b       | 5               | 4                      | 4                       | 4                       | 4                       | 4                       | 4                        | 4                        | 4                        |",
-            "| c       | 1               | 1                      | 1                       | 1                       | 1                       | 1                       | 1                        | 1                        | 1                        |",
-            "+---------+-----------------+------------------------+-------------------------+-------------------------+-------------------------+-------------------------+--------------------------+--------------------------+--------------------------+",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
+            "| c_group | COUNT(test.c_uint64) | COUNT(DISTINCT test.c_int8) | COUNT(DISTINCT test.c_int16) | COUNT(DISTINCT test.c_int32) | COUNT(DISTINCT test.c_int64) | COUNT(DISTINCT test.c_uint8) | COUNT(DISTINCT test.c_uint16) | COUNT(DISTINCT test.c_uint32) | COUNT(DISTINCT test.c_uint64) |",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
+            "| a       | 5                    | 3                           | 3                            | 3                            | 3                            | 3                            | 3                             | 3                             | 3                             |",
+            "| b       | 5                    | 4                           | 4                            | 4                            | 4                            | 4                            | 4                             | 4                             | 4                             |",
+            "| c       | 1                    | 1                           | 1                            | 1                            | 1                            | 1                            | 1                             | 1                             | 1                             |",
+            "+---------+----------------------+-----------------------------+------------------------------+------------------------------+------------------------------+------------------------------+-------------------------------+-------------------------------+-------------------------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
 
@@ -2444,11 +2552,11 @@ mod tests {
             .unwrap();
 
         let expected = vec![
-            "+---------+",
-            "| sqrt(i) |",
-            "+---------+",
-            "| 1       |",
-            "+---------+",
+            "+-----------+",
+            "| sqrt(t.i) |",
+            "+-----------+",
+            "| 1         |",
+            "+-----------+",
         ];
 
         let results = plan_and_collect(&mut ctx, "SELECT sqrt(i) FROM t")
@@ -2532,11 +2640,11 @@ mod tests {
             let provider = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
             ctx.register_table("t", Arc::new(provider)).unwrap();
             let expected = vec![
-                "+---------+",
-                "| sqrt(v) |",
-                "+---------+",
-                "| 1       |",
-                "+---------+",
+                "+-----------+",
+                "| sqrt(t.v) |",
+                "+-----------+",
+                "| 1         |",
+                "+-----------+",
             ];
             let results = plan_and_collect(&mut ctx, "SELECT sqrt(v) FROM t")
                 .await
@@ -2575,11 +2683,11 @@ mod tests {
         let result = plan_and_collect(&mut ctx, "SELECT \"MY_FUNC\"(i) FROM t").await?;
 
         let expected = vec![
-            "+------------+",
-            "| MY_FUNC(i) |",
-            "+------------+",
-            "| 1          |",
-            "+------------+",
+            "+--------------+",
+            "| MY_FUNC(t.i) |",
+            "+--------------+",
+            "| 1            |",
+            "+--------------+",
         ];
         assert_batches_eq!(expected, &result);
 
@@ -2593,11 +2701,11 @@ mod tests {
             .unwrap();
 
         let expected = vec![
-            "+--------+",
-            "| MAX(i) |",
-            "+--------+",
-            "| 1      |",
-            "+--------+",
+            "+----------+",
+            "| MAX(t.i) |",
+            "+----------+",
+            "| 1        |",
+            "+----------+",
         ];
 
         let results = plan_and_collect(&mut ctx, "SELECT max(i) FROM t")
@@ -2656,11 +2764,11 @@ mod tests {
         let result = plan_and_collect(&mut ctx, "SELECT \"MY_AVG\"(i) FROM t").await?;
 
         let expected = vec![
-            "+-----------+",
-            "| MY_AVG(i) |",
-            "+-----------+",
-            "| 1         |",
-            "+-----------+",
+            "+-------------+",
+            "| MY_AVG(t.i) |",
+            "+-------------+",
+            "| 1           |",
+            "+-------------+",
         ];
         assert_batches_eq!(expected, &result);
 
@@ -2756,11 +2864,11 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let expected = vec![
-            "+---------+---------+-----------------+",
-            "| SUM(c1) | SUM(c2) | COUNT(UInt8(1)) |",
-            "+---------+---------+-----------------+",
-            "| 10      | 110     | 20              |",
-            "+---------+---------+-----------------+",
+            "+--------------+--------------+-----------------+",
+            "| SUM(test.c1) | SUM(test.c2) | COUNT(UInt8(1)) |",
+            "+--------------+--------------+-----------------+",
+            "| 10           | 110          | 20              |",
+            "+--------------+--------------+-----------------+",
         ];
         assert_batches_eq!(expected, &results);
 
@@ -2875,14 +2983,14 @@ mod tests {
         let result = collect(plan).await?;
 
         let expected = vec![
-            "+-----+-----+-------------+",
-            "| a   | b   | my_add(a,b) |",
-            "+-----+-----+-------------+",
-            "| 1   | 2   | 3           |",
-            "| 10  | 12  | 22          |",
-            "| 10  | 12  | 22          |",
-            "| 100 | 120 | 220         |",
-            "+-----+-----+-------------+",
+            "+-----+-----+-----------------+",
+            "| a   | b   | my_add(t.a,t.b) |",
+            "+-----+-----+-----------------+",
+            "| 1   | 2   | 3               |",
+            "| 10  | 12  | 22              |",
+            "| 10  | 12  | 22              |",
+            "| 100 | 120 | 220             |",
+            "+-----+-----+-----------------+",
         ];
         assert_batches_eq!(expected, &result);
 
@@ -2985,11 +3093,11 @@ mod tests {
         let result = plan_and_collect(&mut ctx, "SELECT MY_AVG(a) FROM t").await?;
 
         let expected = vec![
-            "+-----------+",
-            "| my_avg(a) |",
-            "+-----------+",
-            "| 3         |",
-            "+-----------+",
+            "+-------------+",
+            "| my_avg(t.a) |",
+            "+-------------+",
+            "| 3           |",
+            "+-------------+",
         ];
         assert_batches_eq!(expected, &result);
 
@@ -3161,10 +3269,6 @@ mod tests {
                 _: &[Expr],
                 _: Option<usize>,
             ) -> Result<Arc<dyn ExecutionPlan>> {
-                unimplemented!()
-            }
-
-            fn statistics(&self) -> crate::datasource::datasource::Statistics {
                 unimplemented!()
             }
         }

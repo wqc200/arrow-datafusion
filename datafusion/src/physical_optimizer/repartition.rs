@@ -109,10 +109,11 @@ mod tests {
     use arrow::datatypes::Schema;
 
     use super::*;
-    use crate::datasource::datasource::Statistics;
+    use crate::datasource::PartitionedFile;
     use crate::physical_plan::metrics::ExecutionPlanMetricsSet;
     use crate::physical_plan::parquet::{ParquetExec, ParquetPartition};
     use crate::physical_plan::projection::ProjectionExec;
+    use crate::physical_plan::Statistics;
 
     #[test]
     fn added_repartition_to_single_partition() -> Result<()> {
@@ -122,12 +123,13 @@ mod tests {
             vec![],
             Arc::new(ParquetExec::new(
                 vec![ParquetPartition::new(
-                    vec!["x".to_string()],
-                    Statistics::default(),
+                    vec![PartitionedFile::from("x".to_string())],
+                    0,
                     metrics.clone(),
                 )],
                 schema,
                 None,
+                Statistics::default(),
                 metrics,
                 None,
                 2048,
@@ -162,12 +164,13 @@ mod tests {
                 vec![],
                 Arc::new(ParquetExec::new(
                     vec![ParquetPartition::new(
-                        vec!["x".to_string()],
-                        Statistics::default(),
+                        vec![PartitionedFile::from("x".to_string())],
+                        0,
                         metrics.clone(),
                     )],
                     schema,
                     None,
+                    Statistics::default(),
                     metrics,
                     None,
                     2048,
