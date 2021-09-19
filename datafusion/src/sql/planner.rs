@@ -102,6 +102,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 verbose,
                 statement,
                 analyze,
+                ..
             } => self.explain_statement_to_plan(*verbose, *analyze, statement),
             Statement::Query(query) => self.query_to_plan(query),
             Statement::ShowVariable { variable } => self.show_variable_to_plan(variable),
@@ -275,9 +276,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     /// Maps the SQL type to the corresponding Arrow `DataType`
     fn make_data_type(&self, sql_type: &SQLDataType) -> Result<DataType> {
         match sql_type {
-            SQLDataType::BigInt => Ok(DataType::Int64),
-            SQLDataType::Int => Ok(DataType::Int32),
-            SQLDataType::SmallInt => Ok(DataType::Int16),
+            SQLDataType::BigInt(_) => Ok(DataType::Int64),
+            SQLDataType::Int(_) => Ok(DataType::Int32),
+            SQLDataType::SmallInt(_) => Ok(DataType::Int16),
             SQLDataType::Char(_) | SQLDataType::Varchar(_) | SQLDataType::Text => {
                 Ok(DataType::Utf8)
             }
@@ -579,7 +580,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     /// Generate a logic plan from an SQL select
-    fn select_to_plan(
+    pub fn select_to_plan(
         &self,
         select: &Select,
         ctes: &mut HashMap<String, LogicalPlan>,
@@ -1049,7 +1050,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         }
     }
 
-    fn sql_expr_to_logical_expr(&self, sql: &SQLExpr, schema: &DFSchema) -> Result<Expr> {
+    pub fn sql_expr_to_logical_expr(&self, sql: &SQLExpr, schema: &DFSchema) -> Result<Expr> {
         match sql {
             SQLExpr::Value(Value::Number(n, _)) => match n.parse::<i64>() {
                 Ok(n) => Ok(lit(n)),
@@ -1830,9 +1831,9 @@ fn extract_possible_join_keys(
 pub fn convert_data_type(sql: &SQLDataType) -> Result<DataType> {
     match sql {
         SQLDataType::Boolean => Ok(DataType::Boolean),
-        SQLDataType::SmallInt => Ok(DataType::Int16),
-        SQLDataType::Int => Ok(DataType::Int32),
-        SQLDataType::BigInt => Ok(DataType::Int64),
+        SQLDataType::SmallInt(_) => Ok(DataType::Int16),
+        SQLDataType::Int(_) => Ok(DataType::Int32),
+        SQLDataType::BigInt(_) => Ok(DataType::Int64),
         SQLDataType::Float(_) | SQLDataType::Real => Ok(DataType::Float64),
         SQLDataType::Double => Ok(DataType::Float64),
         SQLDataType::Char(_) | SQLDataType::Varchar(_) => Ok(DataType::Utf8),
