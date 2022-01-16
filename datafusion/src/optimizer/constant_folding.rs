@@ -15,12 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Boolean comparison rule rewrites redundant comparison expression involving boolean literal into
-//! unary expression.
+//! Constant folding and algebraic simplification
 
-use std::sync::Arc;
-
-use arrow::compute::kernels::cast_utils::string_to_timestamp_nanos;
 use arrow::datatypes::DataType;
 
 use crate::error::Result;
@@ -28,13 +24,12 @@ use crate::execution::context::ExecutionProps;
 use crate::logical_plan::{DFSchemaRef, Expr, ExprRewriter, LogicalPlan, Operator};
 use crate::optimizer::optimizer::OptimizerRule;
 use crate::optimizer::utils;
-use crate::physical_plan::functions::BuiltinScalarFunction;
 use crate::scalar::ScalarValue;
-use arrow::compute::{kernels, DEFAULT_CAST_OPTIONS};
 
-/// Optimizer that simplifies comparison expressions involving boolean literals.
+/// Simplifies plans by rewriting [`Expr`]`s evaluating constants
+/// and applying algebraic simplifications
 ///
-/// Recursively go through all expressions and simplify the following cases:
+/// Example transformations that are applied:
 /// * `expr = true` and `expr != false` to `expr` when `expr` is of boolean type
 /// * `expr = false` and `expr != true` to `!expr` when `expr` is of boolean type
 /// * `true = true` and `false = false` to `true`
@@ -61,22 +56,23 @@ impl OptimizerRule for ConstantFolding {
         // projected columns. With just the projected schema, it's not possible to infer types for
         // expressions that references non-projected columns within the same project plan or its
         // children plans.
-        let mut rewriter = ConstantRewriter {
+        let mut simplifier = Simplifier {
             schemas: plan.all_schemas(),
-            execution_props,
         };
 
+        let mut const_evaluator = utils::ConstEvaluator::new(execution_props);
+
         match plan {
-            LogicalPlan::Filter { predicate, input } => Ok(LogicalPlan::Filter {
-                predicate: predicate.clone().rewrite(&mut rewriter)?,
-                input: Arc::new(self.optimize(input, execution_props)?),
-            }),
-            // Rest: recurse into plan, apply optimization where possible
-            LogicalPlan::Projection { .. }
+            // Recurse into plan, apply optimization where possible
+            LogicalPlan::Filter { .. }
+            | LogicalPlan::Projection { .. }
             | LogicalPlan::Window { .. }
             | LogicalPlan::Aggregate { .. }
             | LogicalPlan::Repartition { .. }
             | LogicalPlan::CreateExternalTable { .. }
+            | LogicalPlan::CreateMemoryTable { .. }
+            | LogicalPlan::DropTable { .. }
+            | LogicalPlan::Values { .. }
             | LogicalPlan::Extension { .. }
             | LogicalPlan::Sort { .. }
             | LogicalPlan::Explain { .. }
@@ -95,7 +91,18 @@ impl OptimizerRule for ConstantFolding {
                 let expr = plan
                     .expressions()
                     .into_iter()
-                    .map(|e| e.rewrite(&mut rewriter))
+                    .map(|e| {
+                        // TODO iterate until no changes are made
+                        // during rewrite (evaluating constants can
+                        // enable new simplifications and
+                        // simplifications can enable new constant
+                        // evaluation)
+                        let new_e = e
+                            // fold constants and then simplify
+                            .rewrite(&mut const_evaluator)?
+                            .rewrite(&mut simplifier)?;
+                        Ok(new_e)
+                    })
                     .collect::<Result<Vec<_>>>()?;
 
                 utils::from_plan(plan, &expr, &new_inputs)
@@ -111,13 +118,16 @@ impl OptimizerRule for ConstantFolding {
     }
 }
 
-struct ConstantRewriter<'a> {
+/// Simplifies [`Expr`]s by applying algebraic transformation rules
+///
+/// For example
+/// `true && col` --> `col` where `col` is a boolean types
+struct Simplifier<'a> {
     /// input schemas
     schemas: Vec<&'a DFSchemaRef>,
-    execution_props: &'a ExecutionProps,
 }
 
-impl<'a> ConstantRewriter<'a> {
+impl<'a> Simplifier<'a> {
     fn is_boolean_type(&self, expr: &Expr) -> bool {
         for schema in &self.schemas {
             if let Ok(DataType::Boolean) = expr.get_type(schema) {
@@ -127,9 +137,97 @@ impl<'a> ConstantRewriter<'a> {
 
         false
     }
+
+    fn boolean_folding_for_or(
+        const_bool: &Option<bool>,
+        bool_expr: Box<Expr>,
+        left_right_order: bool,
+    ) -> Expr {
+        // See if we can fold 'const_bool OR bool_expr' to a constant boolean
+        match const_bool {
+            // TRUE or expr (including NULL) = TRUE
+            Some(true) => Expr::Literal(ScalarValue::Boolean(Some(true))),
+            // FALSE or expr (including NULL) = expr
+            Some(false) => *bool_expr,
+            None => match *bool_expr {
+                // NULL or TRUE = TRUE
+                Expr::Literal(ScalarValue::Boolean(Some(true))) => {
+                    Expr::Literal(ScalarValue::Boolean(Some(true)))
+                }
+                // NULL or FALSE = NULL
+                Expr::Literal(ScalarValue::Boolean(Some(false))) => {
+                    Expr::Literal(ScalarValue::Boolean(None))
+                }
+                // NULL or NULL = NULL
+                Expr::Literal(ScalarValue::Boolean(None)) => {
+                    Expr::Literal(ScalarValue::Boolean(None))
+                }
+                // NULL or expr can be either NULL or TRUE
+                // So let us not rewrite it
+                _ => {
+                    let mut left =
+                        Box::new(Expr::Literal(ScalarValue::Boolean(*const_bool)));
+                    let mut right = bool_expr;
+                    if !left_right_order {
+                        std::mem::swap(&mut left, &mut right);
+                    }
+
+                    Expr::BinaryExpr {
+                        left,
+                        op: Operator::Or,
+                        right,
+                    }
+                }
+            },
+        }
+    }
+
+    fn boolean_folding_for_and(
+        const_bool: &Option<bool>,
+        bool_expr: Box<Expr>,
+        left_right_order: bool,
+    ) -> Expr {
+        // See if we can fold 'const_bool AND bool_expr' to a constant boolean
+        match const_bool {
+            // TRUE and expr (including NULL) = expr
+            Some(true) => *bool_expr,
+            // FALSE and expr (including NULL) = FALSE
+            Some(false) => Expr::Literal(ScalarValue::Boolean(Some(false))),
+            None => match *bool_expr {
+                // NULL and TRUE = NULL
+                Expr::Literal(ScalarValue::Boolean(Some(true))) => {
+                    Expr::Literal(ScalarValue::Boolean(None))
+                }
+                // NULL and FALSE = FALSE
+                Expr::Literal(ScalarValue::Boolean(Some(false))) => {
+                    Expr::Literal(ScalarValue::Boolean(Some(false)))
+                }
+                // NULL and NULL = NULL
+                Expr::Literal(ScalarValue::Boolean(None)) => {
+                    Expr::Literal(ScalarValue::Boolean(None))
+                }
+                // NULL and expr can either be NULL or FALSE
+                // So let us not rewrite it
+                _ => {
+                    let mut left =
+                        Box::new(Expr::Literal(ScalarValue::Boolean(*const_bool)));
+                    let mut right = bool_expr;
+                    if !left_right_order {
+                        std::mem::swap(&mut left, &mut right);
+                    }
+
+                    Expr::BinaryExpr {
+                        left,
+                        op: Operator::And,
+                        right,
+                    }
+                }
+            },
+        }
+    }
 }
 
-impl<'a> ExprRewriter for ConstantRewriter<'a> {
+impl<'a> ExprRewriter for Simplifier<'a> {
     /// rewrite the expression simplifying any constant expressions
     fn mutate(&mut self, expr: Expr) -> Result<Expr> {
         let new_expr = match expr {
@@ -202,74 +300,52 @@ impl<'a> ExprRewriter for ConstantRewriter<'a> {
                         right,
                     },
                 },
+                Operator::Or => match (left.as_ref(), right.as_ref()) {
+                    (Expr::Literal(ScalarValue::Boolean(b)), _)
+                        if self.is_boolean_type(&right) =>
+                    {
+                        Self::boolean_folding_for_or(b, right, true)
+                    }
+                    (_, Expr::Literal(ScalarValue::Boolean(b)))
+                        if self.is_boolean_type(&left) =>
+                    {
+                        Self::boolean_folding_for_or(b, left, false)
+                    }
+                    _ => Expr::BinaryExpr {
+                        left,
+                        op: Operator::Or,
+                        right,
+                    },
+                },
+                Operator::And => match (left.as_ref(), right.as_ref()) {
+                    (Expr::Literal(ScalarValue::Boolean(b)), _)
+                        if self.is_boolean_type(&right) =>
+                    {
+                        Self::boolean_folding_for_and(b, right, true)
+                    }
+                    (_, Expr::Literal(ScalarValue::Boolean(b)))
+                        if self.is_boolean_type(&left) =>
+                    {
+                        Self::boolean_folding_for_and(b, left, false)
+                    }
+                    _ => Expr::BinaryExpr {
+                        left,
+                        op: Operator::And,
+                        right,
+                    },
+                },
                 _ => Expr::BinaryExpr { left, op, right },
             },
+            // Not(Not(expr)) --> expr
             Expr::Not(inner) => {
-                // Not(Not(expr)) --> expr
                 if let Expr::Not(negated_inner) = *inner {
                     *negated_inner
                 } else {
                     Expr::Not(inner)
                 }
             }
-            Expr::ScalarFunction {
-                fun: BuiltinScalarFunction::Now,
-                ..
-            } => Expr::Literal(ScalarValue::TimestampNanosecond(Some(
-                self.execution_props
-                    .query_execution_start_time
-                    .timestamp_nanos(),
-            ))),
-            Expr::ScalarFunction {
-                fun: BuiltinScalarFunction::ToTimestamp,
-                args,
-            } => {
-                if !args.is_empty() {
-                    match &args[0] {
-                        Expr::Literal(ScalarValue::Utf8(Some(val))) => {
-                            match string_to_timestamp_nanos(val) {
-                                Ok(timestamp) => Expr::Literal(
-                                    ScalarValue::TimestampNanosecond(Some(timestamp)),
-                                ),
-                                _ => Expr::ScalarFunction {
-                                    fun: BuiltinScalarFunction::ToTimestamp,
-                                    args,
-                                },
-                            }
-                        }
-                        _ => Expr::ScalarFunction {
-                            fun: BuiltinScalarFunction::ToTimestamp,
-                            args,
-                        },
-                    }
-                } else {
-                    Expr::ScalarFunction {
-                        fun: BuiltinScalarFunction::ToTimestamp,
-                        args,
-                    }
-                }
-            }
-            Expr::Cast {
-                expr: inner,
-                data_type,
-            } => match inner.as_ref() {
-                Expr::Literal(val) => {
-                    let scalar_array = val.to_array();
-                    let cast_array = kernels::cast::cast_with_options(
-                        &scalar_array,
-                        &data_type,
-                        &DEFAULT_CAST_OPTIONS,
-                    )?;
-                    let cast_scalar = ScalarValue::try_from_array(&cast_array, 0)?;
-                    Expr::Literal(cast_scalar)
-                }
-                _ => Expr::Cast {
-                    expr: inner,
-                    data_type,
-                },
-            },
             expr => {
-                // no rewrite possible
+                // no additional rewrites possible
                 expr
             }
         };
@@ -279,13 +355,17 @@ impl<'a> ExprRewriter for ConstantRewriter<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::logical_plan::{
-        col, lit, max, min, DFField, DFSchema, LogicalPlanBuilder,
+    use crate::{
+        assert_contains,
+        logical_plan::{col, lit, max, min, DFField, DFSchema, LogicalPlanBuilder},
+        physical_plan::functions::BuiltinScalarFunction,
     };
 
     use arrow::datatypes::*;
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, TimeZone, Utc};
 
     fn test_table_scan() -> Result<LogicalPlan> {
         let schema = Schema::new(vec![
@@ -310,9 +390,8 @@ mod tests {
     #[test]
     fn optimize_expr_not_not() -> Result<()> {
         let schema = expr_test_schema();
-        let mut rewriter = ConstantRewriter {
+        let mut rewriter = Simplifier {
             schemas: vec![&schema],
-            execution_props: &ExecutionProps::new(),
         };
 
         assert_eq!(
@@ -326,9 +405,8 @@ mod tests {
     #[test]
     fn optimize_expr_null_comparison() -> Result<()> {
         let schema = expr_test_schema();
-        let mut rewriter = ConstantRewriter {
+        let mut rewriter = Simplifier {
             schemas: vec![&schema],
-            execution_props: &ExecutionProps::new(),
         };
 
         // x = null is always null
@@ -362,9 +440,8 @@ mod tests {
     #[test]
     fn optimize_expr_eq() -> Result<()> {
         let schema = expr_test_schema();
-        let mut rewriter = ConstantRewriter {
+        let mut rewriter = Simplifier {
             schemas: vec![&schema],
-            execution_props: &ExecutionProps::new(),
         };
 
         assert_eq!(col("c2").get_type(&schema)?, DataType::Boolean);
@@ -393,9 +470,8 @@ mod tests {
     #[test]
     fn optimize_expr_eq_skip_nonboolean_type() -> Result<()> {
         let schema = expr_test_schema();
-        let mut rewriter = ConstantRewriter {
+        let mut rewriter = Simplifier {
             schemas: vec![&schema],
-            execution_props: &ExecutionProps::new(),
         };
 
         // When one of the operand is not of boolean type, folding the other boolean constant will
@@ -433,9 +509,8 @@ mod tests {
     #[test]
     fn optimize_expr_not_eq() -> Result<()> {
         let schema = expr_test_schema();
-        let mut rewriter = ConstantRewriter {
+        let mut rewriter = Simplifier {
             schemas: vec![&schema],
-            execution_props: &ExecutionProps::new(),
         };
 
         assert_eq!(col("c2").get_type(&schema)?, DataType::Boolean);
@@ -469,9 +544,8 @@ mod tests {
     #[test]
     fn optimize_expr_not_eq_skip_nonboolean_type() -> Result<()> {
         let schema = expr_test_schema();
-        let mut rewriter = ConstantRewriter {
+        let mut rewriter = Simplifier {
             schemas: vec![&schema],
-            execution_props: &ExecutionProps::new(),
         };
 
         // when one of the operand is not of boolean type, folding the other boolean constant will
@@ -505,9 +579,8 @@ mod tests {
     #[test]
     fn optimize_expr_case_when_then_else() -> Result<()> {
         let schema = expr_test_schema();
-        let mut rewriter = ConstantRewriter {
+        let mut rewriter = Simplifier {
             schemas: vec![&schema],
-            execution_props: &ExecutionProps::new(),
         };
 
         assert_eq!(
@@ -592,7 +665,7 @@ mod tests {
 
         let expected = "\
         Projection: #test.a\
-        \n  Filter: NOT #test.b And #test.c\
+        \n  Filter: NOT #test.b AND #test.c\
         \n    TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -609,7 +682,7 @@ mod tests {
 
         let expected = "\
         Projection: #test.a\
-        \n  Filter: NOT #test.b Or NOT #test.c\
+        \n  Filter: NOT #test.b OR NOT #test.c\
         \n    TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -668,6 +741,20 @@ mod tests {
         Ok(())
     }
 
+    // expect optimizing will result in an error, returning the error string
+    fn get_optimized_plan_err(plan: &LogicalPlan, date_time: &DateTime<Utc>) -> String {
+        let rule = ConstantFolding::new();
+        let execution_props = ExecutionProps {
+            query_execution_start_time: *date_time,
+        };
+
+        let err = rule
+            .optimize(plan, &execution_props)
+            .expect_err("expected optimization to fail");
+
+        err.to_string()
+    }
+
     fn get_optimized_plan_formatted(
         plan: &LogicalPlan,
         date_time: &DateTime<Utc>,
@@ -683,15 +770,19 @@ mod tests {
         return format!("{:?}", optimized_plan);
     }
 
-    #[test]
-    fn to_timestamp_expr() {
-        let table_scan = test_table_scan().unwrap();
-        let proj = vec![Expr::ScalarFunction {
-            args: vec![Expr::Literal(ScalarValue::Utf8(Some(
-                "2020-09-08T12:00:00+00:00".to_string(),
-            )))],
+    /// Create a to_timestamp expr
+    fn to_timestamp_expr(arg: impl Into<String>) -> Expr {
+        Expr::ScalarFunction {
+            args: vec![lit(arg.into())],
             fun: BuiltinScalarFunction::ToTimestamp,
-        }];
+        }
+    }
+
+    #[test]
+    fn to_timestamp_expr_folded() {
+        let table_scan = test_table_scan().unwrap();
+        let proj = vec![to_timestamp_expr("2020-09-08T12:00:00+00:00")];
+
         let plan = LogicalPlanBuilder::from(table_scan)
             .project(proj)
             .unwrap()
@@ -701,55 +792,30 @@ mod tests {
         let expected = "Projection: TimestampNanosecond(1599566400000000000)\
             \n  TableScan: test projection=None"
             .to_string();
-        let actual = get_optimized_plan_formatted(&plan, &chrono::Utc::now());
+        let actual = get_optimized_plan_formatted(&plan, &Utc::now());
         assert_eq!(expected, actual);
     }
 
     #[test]
     fn to_timestamp_expr_wrong_arg() {
         let table_scan = test_table_scan().unwrap();
-        let proj = vec![Expr::ScalarFunction {
-            args: vec![Expr::Literal(ScalarValue::Utf8(Some(
-                "I'M NOT A TIMESTAMP".to_string(),
-            )))],
-            fun: BuiltinScalarFunction::ToTimestamp,
-        }];
+        let proj = vec![to_timestamp_expr("I'M NOT A TIMESTAMP")];
         let plan = LogicalPlanBuilder::from(table_scan)
             .project(proj)
             .unwrap()
             .build()
             .unwrap();
 
-        let expected = "Projection: totimestamp(Utf8(\"I\'M NOT A TIMESTAMP\"))\
-            \n  TableScan: test projection=None";
-        let actual = get_optimized_plan_formatted(&plan, &chrono::Utc::now());
-        assert_eq!(expected, actual);
-    }
-
-    #[test]
-    fn to_timestamp_expr_no_arg() {
-        let table_scan = test_table_scan().unwrap();
-        let proj = vec![Expr::ScalarFunction {
-            args: vec![],
-            fun: BuiltinScalarFunction::ToTimestamp,
-        }];
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .project(proj)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        let expected = "Projection: totimestamp()\
-            \n  TableScan: test projection=None";
-        let actual = get_optimized_plan_formatted(&plan, &chrono::Utc::now());
-        assert_eq!(expected, actual);
+        let expected = "Error parsing 'I'M NOT A TIMESTAMP' as timestamp";
+        let actual = get_optimized_plan_err(&plan, &Utc::now());
+        assert_contains!(actual, expected);
     }
 
     #[test]
     fn cast_expr() {
         let table_scan = test_table_scan().unwrap();
         let proj = vec![Expr::Cast {
-            expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some("0".to_string())))),
+            expr: Box::new(lit("0")),
             data_type: DataType::Int32,
         }];
         let plan = LogicalPlanBuilder::from(table_scan)
@@ -760,7 +826,7 @@ mod tests {
 
         let expected = "Projection: Int32(0)\
             \n  TableScan: test projection=None";
-        let actual = get_optimized_plan_formatted(&plan, &chrono::Utc::now());
+        let actual = get_optimized_plan_formatted(&plan, &Utc::now());
         assert_eq!(expected, actual);
     }
 
@@ -768,7 +834,7 @@ mod tests {
     fn cast_expr_wrong_arg() {
         let table_scan = test_table_scan().unwrap();
         let proj = vec![Expr::Cast {
-            expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some("".to_string())))),
+            expr: Box::new(lit("")),
             data_type: DataType::Int32,
         }];
         let plan = LogicalPlanBuilder::from(table_scan)
@@ -777,52 +843,26 @@ mod tests {
             .build()
             .unwrap();
 
-        let expected = "Projection: Int32(NULL)\
-            \n  TableScan: test projection=None";
-        let actual = get_optimized_plan_formatted(&plan, &chrono::Utc::now());
-        assert_eq!(expected, actual);
+        let expected =
+            "Cannot cast string '' to value of arrow::datatypes::types::Int32Type type";
+        let actual = get_optimized_plan_err(&plan, &Utc::now());
+        assert_contains!(actual, expected);
     }
 
-    #[test]
-    fn single_now_expr() {
-        let table_scan = test_table_scan().unwrap();
-        let proj = vec![Expr::ScalarFunction {
+    fn now_expr() -> Expr {
+        Expr::ScalarFunction {
             args: vec![],
             fun: BuiltinScalarFunction::Now,
-        }];
-        let time = chrono::Utc::now();
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .project(proj)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        let expected = format!(
-            "Projection: TimestampNanosecond({})\
-            \n  TableScan: test projection=None",
-            time.timestamp_nanos()
-        );
-        let actual = get_optimized_plan_formatted(&plan, &time);
-
-        assert_eq!(expected, actual);
+        }
     }
 
     #[test]
     fn multiple_now_expr() {
         let table_scan = test_table_scan().unwrap();
-        let time = chrono::Utc::now();
+        let time = Utc::now();
         let proj = vec![
-            Expr::ScalarFunction {
-                args: vec![],
-                fun: BuiltinScalarFunction::Now,
-            },
-            Expr::Alias(
-                Box::new(Expr::ScalarFunction {
-                    args: vec![],
-                    fun: BuiltinScalarFunction::Now,
-                }),
-                "t2".to_string(),
-            ),
+            now_expr(),
+            Expr::Alias(Box::new(now_expr()), "t2".to_string()),
         ];
         let plan = LogicalPlanBuilder::from(table_scan)
             .project(proj)
@@ -830,6 +870,7 @@ mod tests {
             .build()
             .unwrap();
 
+        // expect the same timestamp appears in both exprs
         let actual = get_optimized_plan_formatted(&plan, &time);
         let expected = format!(
             "Projection: TimestampNanosecond({}), TimestampNanosecond({}) AS t2\
@@ -839,5 +880,194 @@ mod tests {
         );
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn simplify_and_eval() {
+        // demonstrate a case where the evaluation needs to run prior
+        // to the simplifier for it to work
+        let table_scan = test_table_scan().unwrap();
+        let time = Utc::now();
+        // (true or false) != col --> !col
+        let proj = vec![lit(true).or(lit(false)).not_eq(col("a"))];
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(proj)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let actual = get_optimized_plan_formatted(&plan, &time);
+        let expected = "Projection: NOT #test.a\
+                        \n  TableScan: test projection=None";
+
+        assert_eq!(actual, expected);
+    }
+
+    fn cast_to_int64_expr(expr: Expr) -> Expr {
+        Expr::Cast {
+            expr: expr.into(),
+            data_type: DataType::Int64,
+        }
+    }
+
+    #[test]
+    fn now_less_than_timestamp() {
+        let table_scan = test_table_scan().unwrap();
+
+        let ts_string = "2020-09-08T12:05:00+00:00";
+        let time = chrono::Utc.timestamp_nanos(1599566400000000000i64);
+
+        //  now() < cast(to_timestamp(...) as int) + 5000000000
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .filter(
+                cast_to_int64_expr(now_expr())
+                    .lt(cast_to_int64_expr(to_timestamp_expr(ts_string)) + lit(50000)),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Note that constant folder runs and folds the entire
+        // expression down to a single constant (true)
+        let expected = "Filter: Boolean(true)\
+                        \n  TableScan: test projection=None";
+        let actual = get_optimized_plan_formatted(&plan, &time);
+
+        assert_eq!(expected, actual);
+    }
+    #[test]
+    fn optimize_expr_bool_or() -> Result<()> {
+        let schema = expr_test_schema();
+        let mut rewriter = Simplifier {
+            schemas: vec![&schema],
+        };
+
+        // col || true is always true
+        assert_eq!(
+            (col("c2").or(Expr::Literal(ScalarValue::Boolean(Some(true)))))
+                .rewrite(&mut rewriter)?,
+            lit(ScalarValue::Boolean(Some(true))),
+        );
+
+        // col || false is always col
+        assert_eq!(
+            (col("c2").or(Expr::Literal(ScalarValue::Boolean(Some(false)))))
+                .rewrite(&mut rewriter)?,
+            col("c2"),
+        );
+
+        // true || null is always true
+        assert_eq!(
+            (Expr::Literal(ScalarValue::Boolean(Some(true)))
+                .or(Expr::Literal(ScalarValue::Boolean(None))))
+            .rewrite(&mut rewriter)?,
+            lit(ScalarValue::Boolean(Some(true))),
+        );
+
+        // null || true is always true
+        assert_eq!(
+            (Expr::Literal(ScalarValue::Boolean(None))
+                .or(Expr::Literal(ScalarValue::Boolean(Some(true)))))
+            .rewrite(&mut rewriter)?,
+            lit(ScalarValue::Boolean(Some(true))),
+        );
+
+        // false || null is always null
+        assert_eq!(
+            (Expr::Literal(ScalarValue::Boolean(Some(false)))
+                .or(Expr::Literal(ScalarValue::Boolean(None))))
+            .rewrite(&mut rewriter)?,
+            lit(ScalarValue::Boolean(None)),
+        );
+
+        // null || false is always null
+        assert_eq!(
+            (Expr::Literal(ScalarValue::Boolean(None))
+                .or(Expr::Literal(ScalarValue::Boolean(Some(false)))))
+            .rewrite(&mut rewriter)?,
+            lit(ScalarValue::Boolean(None)),
+        );
+
+        // ( c1 BETWEEN Int32(0) AND Int32(10) ) OR Boolean(NULL)
+        // it can be either NULL or  TRUE depending on the value of `c1 BETWEEN Int32(0) AND Int32(10)`
+        // and should not be rewritten
+        let expr = Expr::Between {
+            expr: Box::new(col("c1")),
+            negated: false,
+            low: Box::new(lit(0)),
+            high: Box::new(lit(10)),
+        };
+        let expr = expr.or(Expr::Literal(ScalarValue::Boolean(None)));
+        let result = expr.clone().rewrite(&mut rewriter)?;
+        assert_eq!(expr, result);
+
+        Ok(())
+    }
+    #[test]
+    fn optimize_expr_bool_and() -> Result<()> {
+        let schema = expr_test_schema();
+        let mut rewriter = Simplifier {
+            schemas: vec![&schema],
+        };
+
+        // col & true is always col
+        assert_eq!(
+            (col("c2").and(Expr::Literal(ScalarValue::Boolean(Some(true)))))
+                .rewrite(&mut rewriter)?,
+            col("c2"),
+        );
+        // col & false is always false
+        assert_eq!(
+            (col("c2").and(Expr::Literal(ScalarValue::Boolean(Some(false)))))
+                .rewrite(&mut rewriter)?,
+            lit(ScalarValue::Boolean(Some(false))),
+        );
+
+        // true && null is always null
+        assert_eq!(
+            (Expr::Literal(ScalarValue::Boolean(Some(true)))
+                .and(Expr::Literal(ScalarValue::Boolean(None))))
+            .rewrite(&mut rewriter)?,
+            lit(ScalarValue::Boolean(None)),
+        );
+
+        // null && true is always null
+        assert_eq!(
+            (Expr::Literal(ScalarValue::Boolean(None))
+                .and(Expr::Literal(ScalarValue::Boolean(Some(true)))))
+            .rewrite(&mut rewriter)?,
+            lit(ScalarValue::Boolean(None)),
+        );
+
+        // false && null is always false
+        assert_eq!(
+            (Expr::Literal(ScalarValue::Boolean(Some(false)))
+                .and(Expr::Literal(ScalarValue::Boolean(None))))
+            .rewrite(&mut rewriter)?,
+            lit(ScalarValue::Boolean(Some(false))),
+        );
+
+        // null && false is always false
+        assert_eq!(
+            (Expr::Literal(ScalarValue::Boolean(None))
+                .and(Expr::Literal(ScalarValue::Boolean(Some(false)))))
+            .rewrite(&mut rewriter)?,
+            lit(ScalarValue::Boolean(Some(false))),
+        );
+
+        // c1 BETWEEN Int32(0) AND Int32(10) AND Boolean(NULL)
+        // it can be either NULL or FALSE depending on the value of `c1 BETWEEN Int32(0) AND Int32(10`
+        // and should not be rewritten
+        let expr = Expr::Between {
+            expr: Box::new(col("c1")),
+            negated: false,
+            low: Box::new(lit(0)),
+            high: Box::new(lit(10)),
+        };
+        let expr = expr.and(Expr::Literal(ScalarValue::Boolean(None)));
+        let result = expr.clone().rewrite(&mut rewriter)?;
+        assert_eq!(expr, result);
+
+        Ok(())
     }
 }

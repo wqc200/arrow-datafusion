@@ -76,6 +76,8 @@ pub enum LogicalPlan {
         input: Arc<LogicalPlan>,
         /// The schema description of the output
         schema: DFSchemaRef,
+        /// Projection output relation alias
+        alias: Option<String>,
     },
     /// Filters rows from its input that do not match an
     /// expression (essentially a WHERE clause with a predicate
@@ -133,6 +135,8 @@ pub enum LogicalPlan {
         join_constraint: JoinConstraint,
         /// The output schema, containing fields from the left and right inputs
         schema: DFSchemaRef,
+        /// If null_equals_null is true, null == null else null != null
+        null_equals_null: bool,
     },
     /// Apply Cross Join to two logical plans
     CrossJoin {
@@ -201,6 +205,31 @@ pub enum LogicalPlan {
         /// Whether the CSV file contains a header
         has_header: bool,
     },
+    /// Creates an in memory table.
+    CreateMemoryTable {
+        /// The table name
+        name: String,
+        /// The logical plan
+        input: Arc<LogicalPlan>,
+    },
+    /// Drops a table.
+    DropTable {
+        /// The table name
+        name: String,
+        /// If the table exists
+        if_exist: bool,
+        /// Dummy schema
+        schema: DFSchemaRef,
+    },
+    /// Values expression. See
+    /// [Postgres VALUES](https://www.postgresql.org/docs/current/queries-values.html)
+    /// documentation for more details.
+    Values {
+        /// The table schema
+        schema: DFSchemaRef,
+        /// Values
+        values: Vec<Vec<Expr>>,
+    },
     /// Produces a relation with string representations of
     /// various parts of the plan
     Explain {
@@ -235,6 +264,7 @@ impl LogicalPlan {
     pub fn schema(&self) -> &DFSchemaRef {
         match self {
             LogicalPlan::EmptyRelation { schema, .. } => schema,
+            LogicalPlan::Values { schema, .. } => schema,
             LogicalPlan::TableScan {
                 projected_schema, ..
             } => projected_schema,
@@ -252,6 +282,8 @@ impl LogicalPlan {
             LogicalPlan::Analyze { schema, .. } => schema,
             LogicalPlan::Extension { node } => node.schema(),
             LogicalPlan::Union { schema, .. } => schema,
+            LogicalPlan::CreateMemoryTable { input, .. } => input.schema(),
+            LogicalPlan::DropTable { schema, .. } => schema,
         }
     }
 
@@ -261,6 +293,7 @@ impl LogicalPlan {
             LogicalPlan::TableScan {
                 projected_schema, ..
             } => vec![projected_schema],
+            LogicalPlan::Values { schema, .. } => vec![schema],
             LogicalPlan::Window { input, schema, .. }
             | LogicalPlan::Aggregate { input, schema, .. }
             | LogicalPlan::Projection { input, schema, .. } => {
@@ -295,7 +328,9 @@ impl LogicalPlan {
             LogicalPlan::Limit { input, .. }
             | LogicalPlan::Repartition { input, .. }
             | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::CreateMemoryTable { input, .. }
             | LogicalPlan::Filter { input, .. } => input.all_schemas(),
+            LogicalPlan::DropTable { .. } => vec![],
         }
     }
 
@@ -313,6 +348,9 @@ impl LogicalPlan {
     pub fn expressions(self: &LogicalPlan) -> Vec<Expr> {
         match self {
             LogicalPlan::Projection { expr, .. } => expr.clone(),
+            LogicalPlan::Values { values, .. } => {
+                values.iter().flatten().cloned().collect()
+            }
             LogicalPlan::Filter { predicate, .. } => vec![predicate.clone()],
             LogicalPlan::Repartition {
                 partitioning_scheme,
@@ -338,6 +376,8 @@ impl LogicalPlan {
             | LogicalPlan::EmptyRelation { .. }
             | LogicalPlan::Limit { .. }
             | LogicalPlan::CreateExternalTable { .. }
+            | LogicalPlan::CreateMemoryTable { .. }
+            | LogicalPlan::DropTable { .. }
             | LogicalPlan::CrossJoin { .. }
             | LogicalPlan::Analyze { .. }
             | LogicalPlan::Explain { .. }
@@ -364,10 +404,13 @@ impl LogicalPlan {
             LogicalPlan::Union { inputs, .. } => inputs.iter().collect(),
             LogicalPlan::Explain { plan, .. } => vec![plan],
             LogicalPlan::Analyze { input: plan, .. } => vec![plan],
+            LogicalPlan::CreateMemoryTable { input, .. } => vec![input],
             // plans without inputs
             LogicalPlan::TableScan { .. }
             | LogicalPlan::EmptyRelation { .. }
-            | LogicalPlan::CreateExternalTable { .. } => vec![],
+            | LogicalPlan::Values { .. }
+            | LogicalPlan::CreateExternalTable { .. }
+            | LogicalPlan::DropTable { .. } => vec![],
         }
     }
 
@@ -500,6 +543,7 @@ impl LogicalPlan {
                 true
             }
             LogicalPlan::Limit { input, .. } => input.accept(visitor)?,
+            LogicalPlan::CreateMemoryTable { input, .. } => input.accept(visitor)?,
             LogicalPlan::Extension { node } => {
                 for input in node.inputs() {
                     if !input.accept(visitor)? {
@@ -513,7 +557,9 @@ impl LogicalPlan {
             // plans without inputs
             LogicalPlan::TableScan { .. }
             | LogicalPlan::EmptyRelation { .. }
-            | LogicalPlan::CreateExternalTable { .. } => true,
+            | LogicalPlan::Values { .. }
+            | LogicalPlan::CreateExternalTable { .. }
+            | LogicalPlan::DropTable { .. } => true,
         };
         if !recurse {
             return Ok(false);
@@ -551,7 +597,7 @@ impl LogicalPlan {
     /// // Format using display_indent
     /// let display_string = format!("{}", plan.display_indent());
     ///
-    /// assert_eq!("Filter: #foo_csv.id Eq Int32(5)\
+    /// assert_eq!("Filter: #foo_csv.id = Int32(5)\
     ///              \n  TableScan: foo_csv projection=None",
     ///             display_string);
     /// ```
@@ -575,7 +621,7 @@ impl LogicalPlan {
     ///
     /// ```text
     /// Projection: #employee.id [id:Int32]\
-    ///    Filter: #employee.state Eq Utf8(\"CO\") [id:Int32, state:Utf8]\
+    ///    Filter: #employee.state = Utf8(\"CO\") [id:Int32, state:Utf8]\
     ///      TableScan: employee projection=Some([0, 3]) [id:Int32, state:Utf8]";
     /// ```
     ///
@@ -592,7 +638,7 @@ impl LogicalPlan {
     /// // Format using display_indent_schema
     /// let display_string = format!("{}", plan.display_indent_schema());
     ///
-    /// assert_eq!("Filter: #foo_csv.id Eq Int32(5) [id:Int32]\
+    /// assert_eq!("Filter: #foo_csv.id = Int32(5) [id:Int32]\
     ///             \n  TableScan: foo_csv projection=None [id:Int32]",
     ///             display_string);
     /// ```
@@ -700,6 +746,25 @@ impl LogicalPlan {
             fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 match &*self.0 {
                     LogicalPlan::EmptyRelation { .. } => write!(f, "EmptyRelation"),
+                    LogicalPlan::Values { ref values, .. } => {
+                        let str_values: Vec<_> = values
+                            .iter()
+                            // limit to only 5 values to avoid horrible display
+                            .take(5)
+                            .map(|row| {
+                                let item = row
+                                    .iter()
+                                    .map(|expr| expr.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("({})", item)
+                            })
+                            .collect();
+
+                        let elipse = if values.len() > 5 { "..." } else { "" };
+                        write!(f, "Values: {}{}", str_values.join(", "), elipse)
+                    }
+
                     LogicalPlan::TableScan {
                         ref table_name,
                         ref projection,
@@ -723,13 +788,18 @@ impl LogicalPlan {
 
                         Ok(())
                     }
-                    LogicalPlan::Projection { ref expr, .. } => {
+                    LogicalPlan::Projection {
+                        ref expr, alias, ..
+                    } => {
                         write!(f, "Projection: ")?;
                         for (i, expr_item) in expr.iter().enumerate() {
                             if i > 0 {
                                 write!(f, ", ")?;
                             }
                             write!(f, "{:?}", expr_item)?;
+                        }
+                        if let Some(a) = alias {
+                            write!(f, ", alias={}", a)?;
                         }
                         Ok(())
                     }
@@ -803,6 +873,14 @@ impl LogicalPlan {
                     LogicalPlan::Limit { ref n, .. } => write!(f, "Limit: {}", n),
                     LogicalPlan::CreateExternalTable { ref name, .. } => {
                         write!(f, "CreateExternalTable: {:?}", name)
+                    }
+                    LogicalPlan::CreateMemoryTable { ref name, .. } => {
+                        write!(f, "CreateMemoryTable: {:?}", name)
+                    }
+                    LogicalPlan::DropTable {
+                        ref name, if_exist, ..
+                    } => {
+                        write!(f, "DropTable: {:?} if not exist:={}", name, if_exist)
                     }
                     LogicalPlan::Explain { .. } => write!(f, "Explain"),
                     LogicalPlan::Analyze { .. } => write!(f, "Analyze"),
@@ -939,7 +1017,7 @@ mod tests {
         let plan = display_plan();
 
         let expected = "Projection: #employee_csv.id\
-        \n  Filter: #employee_csv.state Eq Utf8(\"CO\")\
+        \n  Filter: #employee_csv.state = Utf8(\"CO\")\
         \n    TableScan: employee_csv projection=Some([0, 3])";
 
         assert_eq!(expected, format!("{}", plan.display_indent()));
@@ -950,7 +1028,7 @@ mod tests {
         let plan = display_plan();
 
         let expected = "Projection: #employee_csv.id [id:Int32]\
-                        \n  Filter: #employee_csv.state Eq Utf8(\"CO\") [id:Int32, state:Utf8]\
+                        \n  Filter: #employee_csv.state = Utf8(\"CO\") [id:Int32, state:Utf8]\
                         \n    TableScan: employee_csv projection=Some([0, 3]) [id:Int32, state:Utf8]";
 
         assert_eq!(expected, format!("{}", plan.display_indent_schema()));

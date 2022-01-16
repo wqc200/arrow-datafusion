@@ -105,22 +105,16 @@ fn get_projected_schema(
     }
 
     // create the projected schema
-    let mut projected_fields: Vec<DFField> = Vec::with_capacity(projection.len());
-    match table_name {
-        Some(qualifer) => {
-            for i in &projection {
-                projected_fields.push(DFField::from_qualified(
-                    qualifer,
-                    schema.fields()[*i].clone(),
-                ));
-            }
-        }
-        None => {
-            for i in &projection {
-                projected_fields.push(DFField::from(schema.fields()[*i].clone()));
-            }
-        }
-    }
+    let projected_fields: Vec<DFField> = match table_name {
+        Some(qualifer) => projection
+            .iter()
+            .map(|i| DFField::from_qualified(qualifer, schema.fields()[*i].clone()))
+            .collect(),
+        None => projection
+            .iter()
+            .map(|i| DFField::from(schema.fields()[*i].clone()))
+            .collect(),
+    };
 
     let projection = projection.into_iter().collect::<Vec<_>>();
     Ok((projection, projected_fields.to_dfschema_ref()?))
@@ -140,6 +134,7 @@ fn optimize_plan(
             input,
             expr,
             schema,
+            alias,
         } => {
             // projection:
             // * remove any expression that is not required
@@ -190,6 +185,7 @@ fn optimize_plan(
                     expr: new_expr,
                     input: Arc::new(new_input),
                     schema: DFSchemaRef::new(DFSchema::new(new_fields)?),
+                    alias: alias.clone(),
                 })
             }
         }
@@ -199,6 +195,7 @@ fn optimize_plan(
             on,
             join_type,
             join_constraint,
+            null_equals_null,
             ..
         } => {
             for (l, r) in on {
@@ -235,6 +232,7 @@ fn optimize_plan(
                 join_constraint: *join_constraint,
                 on: on.clone(),
                 schema: DFSchemaRef::new(schema),
+                null_equals_null: *null_equals_null,
             })
         }
         LogicalPlan::Window {
@@ -395,7 +393,6 @@ fn optimize_plan(
                 .filter(|f| new_required_columns.contains(&f.qualified_column()))
                 .map(|f| f.field())
                 .collect::<HashSet<&Field>>();
-
             let new_inputs = inputs
                 .iter()
                 .map(|input_plan| {
@@ -416,10 +413,17 @@ fn optimize_plan(
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
-
+            let new_schema = DFSchema::new(
+                schema
+                    .fields()
+                    .iter()
+                    .filter(|f| union_required_fields.contains(f.field()))
+                    .cloned()
+                    .collect(),
+            )?;
             Ok(LogicalPlan::Union {
                 inputs: new_inputs,
-                schema: schema.clone(),
+                schema: Arc::new(new_schema),
                 alias: alias.clone(),
             })
         }
@@ -429,8 +433,11 @@ fn optimize_plan(
         | LogicalPlan::Filter { .. }
         | LogicalPlan::Repartition { .. }
         | LogicalPlan::EmptyRelation { .. }
+        | LogicalPlan::Values { .. }
         | LogicalPlan::Sort { .. }
         | LogicalPlan::CreateExternalTable { .. }
+        | LogicalPlan::CreateMemoryTable { .. }
+        | LogicalPlan::DropTable { .. }
         | LogicalPlan::CrossJoin { .. }
         | LogicalPlan::Extension { .. } => {
             let expr = plan.expressions();
@@ -472,7 +479,7 @@ mod tests {
         let table_scan = test_table_scan()?;
 
         let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![], vec![max(col("b"))])?
+            .aggregate(Vec::<Expr>::new(), vec![max(col("b"))])?
             .build()?;
 
         let expected = "Aggregate: groupBy=[[]], aggr=[[MAX(#test.b)]]\
@@ -505,7 +512,7 @@ mod tests {
 
         let plan = LogicalPlanBuilder::from(table_scan)
             .filter(col("c"))?
-            .aggregate(vec![], vec![max(col("b"))])?
+            .aggregate(Vec::<Expr>::new(), vec![max(col("b"))])?
             .build()?;
 
         let expected = "Aggregate: groupBy=[[]], aggr=[[MAX(#test.b)]]\
@@ -561,9 +568,9 @@ mod tests {
             .project(vec![col("a"), col("c"), col("b")])?
             .build()?;
         let expected = "Projection: #test.a, #test.c, #test.b\
-        \n  Filter: #test.a Gt Int32(1)\
-        \n    Filter: #test.b Gt Int32(1)\
-        \n      Filter: #test.c Gt Int32(1)\
+        \n  Filter: #test.a > Int32(1)\
+        \n    Filter: #test.b > Int32(1)\
+        \n      Filter: #test.c > Int32(1)\
         \n        TableScan: test projection=Some([0, 1, 2])";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -744,6 +751,7 @@ mod tests {
             expr,
             input: Arc::new(table_scan),
             schema: Arc::new(projected_schema),
+            alias: None,
         };
 
         assert_fields_eq(&plan, vec!["a", "b"]);
@@ -818,7 +826,7 @@ mod tests {
 
         let expected = "\
         Aggregate: groupBy=[[#test.c]], aggr=[[MAX(#test.a)]]\
-        \n  Filter: #test.c Gt Int32(1)\
+        \n  Filter: #test.c > Int32(1)\
         \n    Projection: #test.c, #test.a\
         \n      TableScan: test projection=Some([0, 2])";
 
@@ -888,7 +896,7 @@ mod tests {
         assert_fields_eq(&plan, vec!["c", "a", "MAX(test.b)"]);
 
         let expected = "Projection: #test.c, #test.a, #MAX(test.b)\
-        \n  Filter: #test.c Gt Int32(1)\
+        \n  Filter: #test.c > Int32(1)\
         \n    Aggregate: groupBy=[[#test.a, #test.c]], aggr=[[MAX(#test.b)]]\
         \n      TableScan: test projection=Some([0, 1, 2])";
 

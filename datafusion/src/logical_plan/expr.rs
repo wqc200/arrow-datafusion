@@ -20,7 +20,9 @@
 
 pub use super::Operator;
 use crate::error::{DataFusionError, Result};
+use crate::field_util::get_indexed_field;
 use crate::logical_plan::{window_frames, DFField, DFSchema, LogicalPlan};
+use crate::physical_plan::functions::Volatility;
 use crate::physical_plan::{
     aggregates, expressions::binary_operator_data_type, functions, udf::ScalarUDF,
     window_functions,
@@ -244,6 +246,13 @@ pub enum Expr {
     IsNull(Box<Expr>),
     /// arithmetic negation of an expression, the operand must be of a signed numeric data type
     Negative(Box<Expr>),
+    /// Returns the field of a [`ListArray`] or [`StructArray`] by key
+    GetIndexedField {
+        /// the expression to take the field from
+        expr: Box<Expr>,
+        /// The name of the field to take
+        key: ScalarValue,
+    },
     /// Whether an expression is between a given range.
     Between {
         /// The value to compare
@@ -432,6 +441,11 @@ impl Expr {
             Expr::Wildcard => Err(DataFusionError::Internal(
                 "Wildcard expressions are not valid in a logical query plan".to_owned(),
             )),
+            Expr::GetIndexedField { ref expr, key } => {
+                let data_type = expr.get_type(schema)?;
+
+                get_indexed_field(&data_type, key).map(|x| x.data_type().clone())
+            }
         }
     }
 
@@ -487,6 +501,10 @@ impl Expr {
             Expr::Wildcard => Err(DataFusionError::Internal(
                 "Wildcard expressions are not valid in a logical query plan".to_owned(),
             )),
+            Expr::GetIndexedField { ref expr, key } => {
+                let data_type = expr.get_type(input_schema)?;
+                get_indexed_field(&data_type, key).map(|x| x.is_nullable())
+            }
         }
     }
 
@@ -522,6 +540,9 @@ impl Expr {
     /// This function errors when it is impossible to cast the
     /// expression to the target [arrow::datatypes::DataType].
     pub fn cast_to(self, cast_to_type: &DataType, schema: &DFSchema) -> Result<Expr> {
+        // TODO(kszucs): most of the operations do not validate the type correctness
+        // like all of the binary expressions below. Perhaps Expr should track the
+        // type of the expression?
         let this_type = self.get_type(schema)?;
         if this_type == *cast_to_type {
             Ok(self)
@@ -762,6 +783,7 @@ impl Expr {
                     .try_fold(visitor, |visitor, arg| arg.accept(visitor))
             }
             Expr::Wildcard => Ok(visitor),
+            Expr::GetIndexedField { ref expr, .. } => expr.accept(visitor),
         }?;
 
         visitor.post_visit(self)
@@ -922,6 +944,10 @@ impl Expr {
                 negated,
             },
             Expr::Wildcard => Expr::Wildcard,
+            Expr::GetIndexedField { expr, key } => Expr::GetIndexedField {
+                expr: rewrite_boxed(expr, rewriter)?,
+                key,
+            },
         };
 
         // now rewrite this expression itself
@@ -938,6 +964,33 @@ impl Not for Expr {
 
     fn not(self) -> Self::Output {
         Expr::Not(Box::new(self))
+    }
+}
+
+impl std::fmt::Display for Expr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Expr::BinaryExpr {
+                ref left,
+                ref right,
+                ref op,
+            } => write!(f, "{} {} {}", left, op, right),
+            Expr::AggregateFunction {
+                /// Name of the function
+                ref fun,
+                /// List of expressions to feed to the functions as arguments
+                ref args,
+                /// Whether this is a DISTINCT aggregation or not
+                ref distinct,
+            } => fmt_function(f, &fun.to_string(), *distinct, args, true),
+            Expr::ScalarFunction {
+                /// Name of the function
+                ref fun,
+                /// List of expressions to feed to the functions as arguments
+                ref args,
+            } => fmt_function(f, &fun.to_string(), false, args, true),
+            _ => write!(f, "{:?}", self),
+        }
     }
 }
 
@@ -1255,10 +1308,13 @@ fn normalize_col_with_schemas(
 /// Recursively normalize all Column expressions in a list of expression trees
 #[inline]
 pub fn normalize_cols(
-    exprs: impl IntoIterator<Item = Expr>,
+    exprs: impl IntoIterator<Item = impl Into<Expr>>,
     plan: &LogicalPlan,
 ) -> Result<Vec<Expr>> {
-    exprs.into_iter().map(|e| normalize_col(e, plan)).collect()
+    exprs
+        .into_iter()
+        .map(|e| normalize_col(e.into(), plan))
+        .collect()
 }
 
 /// Recursively 'unnormalize' (remove all qualifiers) from an
@@ -1362,6 +1418,11 @@ pub trait Literal {
     fn lit(&self) -> Expr;
 }
 
+/// Trait for converting a type to a literal timestamp
+pub trait TimestampLiteral {
+    fn lit_timestamp_nano(&self) -> Expr;
+}
+
 impl Literal for &str {
     fn lit(&self) -> Expr {
         Expr::Literal(ScalarValue::Utf8(Some((*self).to_owned())))
@@ -1371,6 +1432,18 @@ impl Literal for &str {
 impl Literal for String {
     fn lit(&self) -> Expr {
         Expr::Literal(ScalarValue::Utf8(Some((*self).to_owned())))
+    }
+}
+
+impl Literal for Vec<u8> {
+    fn lit(&self) -> Expr {
+        Expr::Literal(ScalarValue::Binary(Some((*self).to_owned())))
+    }
+}
+
+impl Literal for &[u8] {
+    fn lit(&self) -> Expr {
+        Expr::Literal(ScalarValue::Binary(Some((*self).to_owned())))
     }
 }
 
@@ -1391,6 +1464,19 @@ macro_rules! make_literal {
     };
 }
 
+macro_rules! make_timestamp_literal {
+    ($TYPE:ty, $SCALAR:ident, $DOC: expr) => {
+        #[doc = $DOC]
+        impl TimestampLiteral for $TYPE {
+            fn lit_timestamp_nano(&self) -> Expr {
+                Expr::Literal(ScalarValue::TimestampNanosecond(Some(
+                    (self.clone()).into(),
+                )))
+            }
+        }
+    };
+}
+
 make_literal!(bool, Boolean, "literal expression containing a bool");
 make_literal!(f32, Float32, "literal expression containing an f32");
 make_literal!(f64, Float64, "literal expression containing an f64");
@@ -1403,9 +1489,22 @@ make_literal!(u16, UInt16, "literal expression containing a u16");
 make_literal!(u32, UInt32, "literal expression containing a u32");
 make_literal!(u64, UInt64, "literal expression containing a u64");
 
+make_timestamp_literal!(i8, Int8, "literal expression containing an i8");
+make_timestamp_literal!(i16, Int16, "literal expression containing an i16");
+make_timestamp_literal!(i32, Int32, "literal expression containing an i32");
+make_timestamp_literal!(i64, Int64, "literal expression containing an i64");
+make_timestamp_literal!(u8, UInt8, "literal expression containing a u8");
+make_timestamp_literal!(u16, UInt16, "literal expression containing a u16");
+make_timestamp_literal!(u32, UInt32, "literal expression containing a u32");
+
 /// Create a literal expression
 pub fn lit<T: Literal>(n: T) -> Expr {
     n.lit()
+}
+
+/// Create a literal timestamp expression
+pub fn lit_timestamp_nano<T: TimestampLiteral>(n: T) -> Expr {
+    n.lit_timestamp_nano()
 }
 
 /// Concatenates the text representations of all the arguments. NULL arguments are ignored.
@@ -1436,6 +1535,23 @@ pub fn random() -> Expr {
     }
 }
 
+/// Returns the approximate number of distinct input values.
+/// This function provides an approximation of count(DISTINCT x).
+/// Zero is returned if all input values are null.
+/// This function should produce a standard error of 0.81%,
+/// which is the standard deviation of the (approximately normal)
+/// error distribution over all possible sets.
+/// It does not guarantee an upper bound on the error for any specific input set.
+pub fn approx_distinct(expr: Expr) -> Expr {
+    Expr::AggregateFunction {
+        fun: aggregates::AggregateFunction::ApproxDistinct,
+        distinct: false,
+        args: vec![expr],
+    }
+}
+
+// TODO(kszucs): this seems buggy, unary_scalar_expr! is used for many
+// varying arity functions
 /// Create an convenience function representing a unary scalar function
 macro_rules! unary_scalar_expr {
     ($ENUM:ident, $FUNC:ident) => {
@@ -1449,7 +1565,7 @@ macro_rules! unary_scalar_expr {
     };
 }
 
-/// Create an convenience function representing a /binaryunary scalar function
+/// Create an convenience function representing a binary scalar function
 macro_rules! binary_scalar_expr {
     ($ENUM:ident, $FUNC:ident) => {
         #[doc = "this scalar function is not documented yet"]
@@ -1522,6 +1638,7 @@ unary_scalar_expr!(Upper, upper);
 // date functions
 binary_scalar_expr!(DatePart, date_part);
 binary_scalar_expr!(DateTrunc, date_trunc);
+binary_scalar_expr!(Digest, digest);
 
 /// returns an array of fixed size with each argument on it.
 pub fn array(args: Vec<Expr>) -> Expr {
@@ -1540,10 +1657,16 @@ pub fn create_udf(
     name: &str,
     input_types: Vec<DataType>,
     return_type: Arc<DataType>,
+    volatility: Volatility,
     fun: ScalarFunctionImplementation,
 ) -> ScalarUDF {
     let return_type: ReturnTypeFunction = Arc::new(move |_| Ok(return_type.clone()));
-    ScalarUDF::new(name, &Signature::Exact(input_types), &return_type, &fun)
+    ScalarUDF::new(
+        name,
+        &Signature::exact(input_types, volatility),
+        &return_type,
+        &fun,
+    )
 }
 
 /// Creates a new UDAF with a specific signature, state type and return type.
@@ -1553,6 +1676,7 @@ pub fn create_udaf(
     name: &str,
     input_type: DataType,
     return_type: Arc<DataType>,
+    volatility: Volatility,
     accumulator: AccumulatorFunctionImplementation,
     state_type: Arc<Vec<DataType>>,
 ) -> AggregateUDF {
@@ -1560,7 +1684,7 @@ pub fn create_udaf(
     let state_type: StateTypeFunction = Arc::new(move |_| Ok(state_type.clone()));
     AggregateUDF::new(
         name,
-        &Signature::Exact(vec![input_type]),
+        &Signature::exact(vec![input_type], volatility),
         &return_type,
         &accumulator,
         &state_type,
@@ -1572,8 +1696,14 @@ fn fmt_function(
     fun: &str,
     distinct: bool,
     args: &[Expr],
+    display: bool,
 ) -> fmt::Result {
-    let args: Vec<String> = args.iter().map(|arg| format!("{:?}", arg)).collect();
+    let args: Vec<String> = match display {
+        true => args.iter().map(|arg| format!("{}", arg)).collect(),
+        false => args.iter().map(|arg| format!("{:?}", arg)).collect(),
+    };
+
+    // let args: Vec<String> = args.iter().map(|arg| format!("{:?}", arg)).collect();
     let distinct_str = match distinct {
         true => "DISTINCT ",
         false => "",
@@ -1617,7 +1747,7 @@ impl fmt::Debug for Expr {
             Expr::IsNull(expr) => write!(f, "{:?} IS NULL", expr),
             Expr::IsNotNull(expr) => write!(f, "{:?} IS NOT NULL", expr),
             Expr::BinaryExpr { left, op, right } => {
-                write!(f, "{:?} {:?} {:?}", left, op, right)
+                write!(f, "{:?} {} {:?}", left, op, right)
             }
             Expr::Sort {
                 expr,
@@ -1636,10 +1766,10 @@ impl fmt::Debug for Expr {
                 }
             }
             Expr::ScalarFunction { fun, args, .. } => {
-                fmt_function(f, &fun.to_string(), false, args)
+                fmt_function(f, &fun.to_string(), false, args, false)
             }
             Expr::ScalarUDF { fun, ref args, .. } => {
-                fmt_function(f, &fun.name, false, args)
+                fmt_function(f, &fun.name, false, args, false)
             }
             Expr::WindowFunction {
                 fun,
@@ -1648,7 +1778,7 @@ impl fmt::Debug for Expr {
                 order_by,
                 window_frame,
             } => {
-                fmt_function(f, &fun.to_string(), false, args)?;
+                fmt_function(f, &fun.to_string(), false, args, false)?;
                 if !partition_by.is_empty() {
                     write!(f, " PARTITION BY {:?}", partition_by)?;
                 }
@@ -1671,9 +1801,9 @@ impl fmt::Debug for Expr {
                 distinct,
                 ref args,
                 ..
-            } => fmt_function(f, &fun.to_string(), *distinct, args),
+            } => fmt_function(f, &fun.to_string(), *distinct, args, true),
             Expr::AggregateUDF { fun, ref args, .. } => {
-                fmt_function(f, &fun.name, false, args)
+                fmt_function(f, &fun.name, false, args, false)
             }
             Expr::Between {
                 expr,
@@ -1699,6 +1829,9 @@ impl fmt::Debug for Expr {
                 }
             }
             Expr::Wildcard => write!(f, "*"),
+            Expr::GetIndexedField { ref expr, key } => {
+                write!(f, "({:?})[{}]", expr, key)
+            }
         }
     }
 }
@@ -1731,7 +1864,7 @@ fn create_name(e: &Expr, input_schema: &DFSchema) -> Result<String> {
         Expr::BinaryExpr { left, op, right } => {
             let left = create_name(left, input_schema)?;
             let right = create_name(right, input_schema)?;
-            Ok(format!("{} {:?} {}", left, op, right))
+            Ok(format!("{} {} {}", left, op, right))
         }
         Expr::Case {
             expr,
@@ -1778,6 +1911,10 @@ fn create_name(e: &Expr, input_schema: &DFSchema) -> Result<String> {
         Expr::IsNotNull(expr) => {
             let expr = create_name(expr, input_schema)?;
             Ok(format!("{} IS NOT NULL", expr))
+        }
+        Expr::GetIndexedField { expr, key } => {
+            let expr = create_name(expr, input_schema)?;
+            Ok(format!("{}[{}]", expr, key))
         }
         Expr::ScalarFunction { fun, args, .. } => {
             create_function_name(&fun.to_string(), false, args, input_schema)
@@ -1835,10 +1972,27 @@ fn create_name(e: &Expr, input_schema: &DFSchema) -> Result<String> {
                 Ok(format!("{} IN ({:?})", expr, list))
             }
         }
-        other => Err(DataFusionError::NotImplemented(format!(
-            "Create name does not support logical expression {:?}",
-            other
-        ))),
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let expr = create_name(expr, input_schema)?;
+            let low = create_name(low, input_schema)?;
+            let high = create_name(high, input_schema)?;
+            if *negated {
+                Ok(format!("{} NOT BETWEEN {} AND {}", expr, low, high))
+            } else {
+                Ok(format!("{} BETWEEN {} AND {}", expr, low, high))
+            }
+        }
+        Expr::Sort { .. } => Err(DataFusionError::Internal(
+            "Create name does not support sort expression".to_string(),
+        )),
+        Expr::Wildcard => Err(DataFusionError::Internal(
+            "Create name does not support wildcard".to_string(),
+        )),
     }
 }
 
@@ -1872,6 +2026,21 @@ mod tests {
     }
 
     #[test]
+    fn test_lit_timestamp_nano() {
+        let expr = col("time").eq(lit_timestamp_nano(10)); // 10 is an implicit i32
+        let expected = col("time").eq(lit(ScalarValue::TimestampNanosecond(Some(10))));
+        assert_eq!(expr, expected);
+
+        let i: i64 = 10;
+        let expr = col("time").eq(lit_timestamp_nano(i));
+        assert_eq!(expr, expected);
+
+        let i: u32 = 10;
+        let expr = col("time").eq(lit_timestamp_nano(i));
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
     fn rewriter_visit() {
         let mut rewriter = RecordingRewriter::default();
         col("state").eq(lit("CO")).rewrite(&mut rewriter).unwrap();
@@ -1879,12 +2048,12 @@ mod tests {
         assert_eq!(
             rewriter.v,
             vec![
-                "Previsited #state Eq Utf8(\"CO\")",
+                "Previsited #state = Utf8(\"CO\")",
                 "Previsited #state",
                 "Mutated #state",
                 "Previsited Utf8(\"CO\")",
                 "Mutated Utf8(\"CO\")",
-                "Mutated #state Eq Utf8(\"CO\")"
+                "Mutated #state = Utf8(\"CO\")"
             ]
         )
     }
@@ -2040,6 +2209,17 @@ mod tests {
     }
 
     #[test]
+    fn digest_function_definitions() {
+        if let Expr::ScalarFunction { fun, args } = digest(col("tableA.a"), lit("md5")) {
+            let name = functions::BuiltinScalarFunction::Digest;
+            assert_eq!(name, fun);
+            assert_eq!(2, args.len());
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[test]
     fn scalar_function_definitions() {
         test_unary_scalar_expr!(Sqrt, sqrt);
         test_unary_scalar_expr!(Sin, sin);
@@ -2106,5 +2286,28 @@ mod tests {
         assert!(exp2 > exp1);
         assert!(exp2 < exp3);
         assert!(exp3 > exp2);
+    }
+
+    #[test]
+    fn combine_zero_filters() {
+        let result = combine_filters(&[]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn combine_one_filter() {
+        let filter = binary_expr(col("c1"), Operator::Lt, lit(1));
+        let result = combine_filters(&[filter.clone()]);
+        assert_eq!(result, Some(filter));
+    }
+
+    #[test]
+    fn combine_multiple_filters() {
+        let filter1 = binary_expr(col("c1"), Operator::Lt, lit(1));
+        let filter2 = binary_expr(col("c2"), Operator::Lt, lit(2));
+        let filter3 = binary_expr(col("c3"), Operator::Lt, lit(3));
+        let result =
+            combine_filters(&[filter1.clone(), filter2.clone(), filter3.clone()]);
+        assert_eq!(result, Some(and(and(filter1, filter2), filter3)));
     }
 }

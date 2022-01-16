@@ -20,14 +20,18 @@
 //! processes.
 
 use super::super::proto_error;
-use crate::datasource::DfTableAdapter;
-use crate::serde::{protobuf, BallistaError};
+use crate::serde::{byte_to_string, protobuf, BallistaError};
 use datafusion::arrow::datatypes::{
     DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit,
 };
-use datafusion::datasource::avro::AvroFile;
-use datafusion::datasource::{CsvFile, PartitionedFile, TableDescriptor};
+use datafusion::datasource::file_format::avro::AvroFormat;
+use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::TableProvider;
+
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::ListingTable;
 use datafusion::logical_plan::{
+    exprlist_to_fields,
     window_frames::{WindowFrame, WindowFrameBound, WindowFrameUnits},
     Column, Expr, JoinConstraint, JoinType, LogicalPlan,
 };
@@ -37,7 +41,7 @@ use datafusion::physical_plan::window_functions::{
     BuiltInWindowFunction, WindowFunction,
 };
 use datafusion::physical_plan::{ColumnStatistics, Statistics};
-use datafusion::{datasource::parquet::ParquetTable, logical_plan::exprlist_to_fields};
+use protobuf::listing_table_scan_node::FileFormatType;
 use protobuf::{
     arrow_type, logical_expr_node::ExprType, scalar_type, DateUnit, PrimitiveScalarType,
     ScalarListValue, ScalarType,
@@ -257,59 +261,6 @@ impl TryInto<DataType> for &protobuf::ArrowType {
     }
 }
 
-impl From<&ColumnStatistics> for protobuf::ColumnStats {
-    fn from(cs: &ColumnStatistics) -> protobuf::ColumnStats {
-        protobuf::ColumnStats {
-            min_value: cs.min_value.as_ref().map(|m| m.try_into().unwrap()),
-            max_value: cs.max_value.as_ref().map(|m| m.try_into().unwrap()),
-            null_count: cs.null_count.map(|n| n as u32).unwrap_or(0),
-            distinct_count: cs.distinct_count.map(|n| n as u32).unwrap_or(0),
-        }
-    }
-}
-
-impl From<&Statistics> for protobuf::Statistics {
-    fn from(s: &Statistics) -> protobuf::Statistics {
-        let none_value = -1_i64;
-        let column_stats = match &s.column_statistics {
-            None => vec![],
-            Some(column_stats) => column_stats.iter().map(|s| s.into()).collect(),
-        };
-        protobuf::Statistics {
-            num_rows: s.num_rows.map(|n| n as i64).unwrap_or(none_value),
-            total_byte_size: s.total_byte_size.map(|n| n as i64).unwrap_or(none_value),
-            column_stats,
-            is_exact: s.is_exact,
-        }
-    }
-}
-
-impl From<&PartitionedFile> for protobuf::PartitionedFile {
-    fn from(pf: &PartitionedFile) -> protobuf::PartitionedFile {
-        protobuf::PartitionedFile {
-            path: pf.path.clone(),
-            statistics: Some((&pf.statistics).into()),
-        }
-    }
-}
-
-impl TryFrom<TableDescriptor> for protobuf::TableDescriptor {
-    type Error = BallistaError;
-
-    fn try_from(desc: TableDescriptor) -> Result<protobuf::TableDescriptor, Self::Error> {
-        let partition_files: Vec<protobuf::PartitionedFile> =
-            desc.partition_files.iter().map(|pf| pf.into()).collect();
-
-        let schema: protobuf::Schema = desc.schema.into();
-
-        Ok(protobuf::TableDescriptor {
-            path: desc.path,
-            partition_files,
-            schema: Some(schema),
-        })
-    }
-}
-
 impl TryInto<DataType> for &Box<protobuf::List> {
     type Error = BallistaError;
     fn try_into(self) -> Result<DataType, Self::Error> {
@@ -408,6 +359,9 @@ impl From<&DataType> for protobuf::arrow_type::ArrowTypeEnum {
                     whole: *whole as u64,
                     fractional: *fractional as u64,
                 })
+            }
+            DataType::Map(_, _) => {
+                unimplemented!("Ballista does not yet support Map data type")
             }
         }
     }
@@ -539,6 +493,7 @@ impl TryFrom<&DataType> for protobuf::scalar_type::Datatype {
             | DataType::Struct(_)
             | DataType::Union(_)
             | DataType::Dictionary(_, _)
+            | DataType::Map(_, _)
             | DataType::Decimal(_, _) => {
                 return Err(proto_error(format!(
                     "Error converting to Datatype to scalar type, {:?} is invalid as a datafusion scalar.",
@@ -720,6 +675,26 @@ impl TryInto<protobuf::LogicalPlanNode> for &LogicalPlan {
     fn try_into(self) -> Result<protobuf::LogicalPlanNode, Self::Error> {
         use protobuf::logical_plan_node::LogicalPlanType;
         match self {
+            LogicalPlan::Values { values, .. } => {
+                let n_cols = if values.is_empty() {
+                    0
+                } else {
+                    values[0].len()
+                } as u64;
+                let values_list = values
+                    .iter()
+                    .flatten()
+                    .map(|v| v.try_into())
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(protobuf::LogicalPlanNode {
+                    logical_plan_type: Some(LogicalPlanType::Values(
+                        protobuf::ValuesNode {
+                            n_cols,
+                            values_list,
+                        },
+                    )),
+                })
+            }
             LogicalPlan::TableScan {
                 table_name,
                 source,
@@ -728,20 +703,7 @@ impl TryInto<protobuf::LogicalPlanNode> for &LogicalPlan {
                 ..
             } => {
                 let schema = source.schema();
-
-                // unwrap the DFTableAdapter to get to the real TableProvider
-                let source = if let Some(adapter) =
-                    source.as_any().downcast_ref::<DfTableAdapter>()
-                {
-                    match &adapter.logical_plan {
-                        LogicalPlan::TableScan { source, .. } => Ok(source.as_any()),
-                        _ => Err(BallistaError::General(
-                            "Invalid LogicalPlan::TableScan".to_owned(),
-                        )),
-                    }
-                } else {
-                    Ok(source.as_any())
-                }?;
+                let source = source.as_any();
 
                 let projection = match projection {
                     None => None,
@@ -762,48 +724,49 @@ impl TryInto<protobuf::LogicalPlanNode> for &LogicalPlan {
                     .map(|filter| filter.try_into())
                     .collect::<Result<Vec<_>, _>>()?;
 
-                if let Some(parquet) = source.downcast_ref::<ParquetTable>() {
-                    let table_desc: protobuf::TableDescriptor =
-                        parquet.desc.descriptor.clone().try_into()?;
+                if let Some(listing_table) = source.downcast_ref::<ListingTable>() {
+                    let any = listing_table.options().format.as_any();
+                    let file_format_type = if let Some(parquet) =
+                        any.downcast_ref::<ParquetFormat>()
+                    {
+                        FileFormatType::Parquet(protobuf::ParquetFormat {
+                            enable_pruning: parquet.enable_pruning(),
+                        })
+                    } else if let Some(csv) = any.downcast_ref::<CsvFormat>() {
+                        FileFormatType::Csv(protobuf::CsvFormat {
+                            delimiter: byte_to_string(csv.delimiter())?,
+                            has_header: csv.has_header(),
+                        })
+                    } else if any.is::<AvroFormat>() {
+                        FileFormatType::Avro(protobuf::AvroFormat {})
+                    } else {
+                        return Err(proto_error(format!(
+                            "Error converting file format, {:?} is invalid as a datafusion foramt.",
+                            listing_table.options().format
+                        )));
+                    };
                     Ok(protobuf::LogicalPlanNode {
-                        logical_plan_type: Some(LogicalPlanType::ParquetScan(
-                            protobuf::ParquetTableScanNode {
+                        logical_plan_type: Some(LogicalPlanType::ListingScan(
+                            protobuf::ListingTableScanNode {
+                                file_format_type: Some(file_format_type),
                                 table_name: table_name.to_owned(),
-                                table_desc: Some(table_desc),
-                                projection,
-                                filters,
-                            },
-                        )),
-                    })
-                } else if let Some(csv) = source.downcast_ref::<CsvFile>() {
-                    let delimiter = [csv.delimiter()];
-                    let delimiter = std::str::from_utf8(&delimiter).map_err(|_| {
-                        BallistaError::General("Invalid CSV delimiter".to_owned())
-                    })?;
-                    Ok(protobuf::LogicalPlanNode {
-                        logical_plan_type: Some(LogicalPlanType::CsvScan(
-                            protobuf::CsvTableScanNode {
-                                table_name: table_name.to_owned(),
-                                path: csv.path().to_owned(),
-                                projection,
+                                collect_stat: listing_table.options().collect_stat,
+                                file_extension: listing_table
+                                    .options()
+                                    .file_extension
+                                    .clone(),
+                                table_partition_cols: listing_table
+                                    .options()
+                                    .table_partition_cols
+                                    .clone(),
+                                path: listing_table.table_path().to_owned(),
                                 schema: Some(schema),
-                                has_header: csv.has_header(),
-                                delimiter: delimiter.to_string(),
-                                file_extension: csv.file_extension().to_string(),
-                                filters,
-                            },
-                        )),
-                    })
-                } else if let Some(avro) = source.downcast_ref::<AvroFile>() {
-                    Ok(protobuf::LogicalPlanNode {
-                        logical_plan_type: Some(LogicalPlanType::AvroScan(
-                            protobuf::AvroTableScanNode {
-                                table_name: table_name.to_owned(),
-                                path: avro.path().to_owned(),
                                 projection,
-                                schema: Some(schema),
-                                file_extension: avro.file_extension().to_string(),
                                 filters,
+                                target_partitions: listing_table
+                                    .options()
+                                    .target_partitions
+                                    as u32,
                             },
                         )),
                     })
@@ -814,19 +777,23 @@ impl TryInto<protobuf::LogicalPlanNode> for &LogicalPlan {
                     )))
                 }
             }
-            LogicalPlan::Projection { expr, input, .. } => {
-                Ok(protobuf::LogicalPlanNode {
-                    logical_plan_type: Some(LogicalPlanType::Projection(Box::new(
-                        protobuf::ProjectionNode {
-                            input: Some(Box::new(input.as_ref().try_into()?)),
-                            expr: expr
-                                .iter()
-                                .map(|expr| expr.try_into())
-                                .collect::<Result<Vec<_>, BallistaError>>()?,
-                        },
-                    ))),
-                })
-            }
+            LogicalPlan::Projection {
+                expr, input, alias, ..
+            } => Ok(protobuf::LogicalPlanNode {
+                logical_plan_type: Some(LogicalPlanType::Projection(Box::new(
+                    protobuf::ProjectionNode {
+                        input: Some(Box::new(input.as_ref().try_into()?)),
+                        expr: expr.iter().map(|expr| expr.try_into()).collect::<Result<
+                            Vec<_>,
+                            BallistaError,
+                        >>(
+                        )?,
+                        optional_alias: alias
+                            .clone()
+                            .map(protobuf::projection_node::OptionalAlias::Alias),
+                    },
+                ))),
+            }),
             LogicalPlan::Filter { predicate, input } => {
                 let input: protobuf::LogicalPlanNode = input.as_ref().try_into()?;
                 Ok(protobuf::LogicalPlanNode {
@@ -883,6 +850,7 @@ impl TryInto<protobuf::LogicalPlanNode> for &LogicalPlan {
                 on,
                 join_type,
                 join_constraint,
+                null_equals_null,
                 ..
             } => {
                 let left: protobuf::LogicalPlanNode = left.as_ref().try_into()?;
@@ -901,6 +869,7 @@ impl TryInto<protobuf::LogicalPlanNode> for &LogicalPlan {
                             join_constraint: join_constraint.into(),
                             left_join_column,
                             right_join_column,
+                            null_equals_null: *null_equals_null,
                         },
                     ))),
                 })
@@ -1039,6 +1008,12 @@ impl TryInto<protobuf::LogicalPlanNode> for &LogicalPlan {
                     ))),
                 })
             }
+            LogicalPlan::CreateMemoryTable { .. } => Err(proto_error(
+                "Error converting CreateMemoryTable. Not yet supported in Ballista",
+            )),
+            LogicalPlan::DropTable { .. } => Err(proto_error(
+                "Error converting DropTable. Not yet supported in Ballista",
+            )),
         }
     }
 }
@@ -1146,6 +1121,9 @@ impl TryInto<protobuf::LogicalExprNode> for &Expr {
                 ref fun, ref args, ..
             } => {
                 let aggr_function = match fun {
+                    AggregateFunction::ApproxDistinct => {
+                        protobuf::AggregateFunction::ApproxDistinct
+                    }
                     AggregateFunction::Min => protobuf::AggregateFunction::Min,
                     AggregateFunction::Max => protobuf::AggregateFunction::Max,
                     AggregateFunction::Sum => protobuf::AggregateFunction::Sum,
@@ -1379,6 +1357,7 @@ impl From<&AggregateFunction> for protobuf::AggregateFunction {
             AggregateFunction::Sum => Self::Sum,
             AggregateFunction::Avg => Self::Avg,
             AggregateFunction::Count => Self::Count,
+            AggregateFunction::ApproxDistinct => Self::ApproxDistinct,
         }
     }
 }
@@ -1494,6 +1473,7 @@ impl TryInto<protobuf::ScalarFunction> for &BuiltinScalarFunction {
             BuiltinScalarFunction::SHA256 => Ok(protobuf::ScalarFunction::Sha256),
             BuiltinScalarFunction::SHA384 => Ok(protobuf::ScalarFunction::Sha384),
             BuiltinScalarFunction::SHA512 => Ok(protobuf::ScalarFunction::Sha512),
+            BuiltinScalarFunction::Digest => Ok(protobuf::ScalarFunction::Digest),
             BuiltinScalarFunction::ToTimestampMillis => {
                 Ok(protobuf::ScalarFunction::Totimestampmillis)
             }

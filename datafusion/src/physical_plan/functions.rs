@@ -56,9 +56,9 @@ use fmt::{Debug, Formatter};
 use std::convert::From;
 use std::{any::Any, fmt, str::FromStr, sync::Arc};
 
-/// A function's signature, which defines the function's supported argument types.
+/// A function's type signature, which defines the function's supported argument types.
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
-pub enum Signature {
+pub enum TypeSignature {
     /// arbitrary number of arguments of an common type out of a list of valid types
     // A function such as `concat` is `Variadic(vec![DataType::Utf8, DataType::LargeUtf8])`
     Variadic(Vec<DataType>),
@@ -75,7 +75,83 @@ pub enum Signature {
     /// fixed number of arguments of arbitrary types
     Any(usize),
     /// One of a list of signatures
-    OneOf(Vec<Signature>),
+    OneOf(Vec<TypeSignature>),
+}
+
+///The Signature of a function defines its supported input types as well as its volatility.
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub struct Signature {
+    /// type_signature - The types that the function accepts. See [TypeSignature] for more information.
+    pub type_signature: TypeSignature,
+    /// volatility - The volatility of the function. See [Volatility] for more information.
+    pub volatility: Volatility,
+}
+
+impl Signature {
+    /// new - Creates a new Signature from any type signature and the volatility.
+    pub fn new(type_signature: TypeSignature, volatility: Volatility) -> Self {
+        Signature {
+            type_signature,
+            volatility,
+        }
+    }
+    /// variadic - Creates a variadic signature that represents an arbitrary number of arguments all from a type in common_types.
+    pub fn variadic(common_types: Vec<DataType>, volatility: Volatility) -> Self {
+        Self {
+            type_signature: TypeSignature::Variadic(common_types),
+            volatility,
+        }
+    }
+    /// variadic_equal - Creates a variadic signature that represents an arbitrary number of arguments of the same type.
+    pub fn variadic_equal(volatility: Volatility) -> Self {
+        Self {
+            type_signature: TypeSignature::VariadicEqual,
+            volatility,
+        }
+    }
+    /// uniform - Creates a function with a fixed number of arguments of the same type, which must be from valid_types.
+    pub fn uniform(
+        arg_count: usize,
+        valid_types: Vec<DataType>,
+        volatility: Volatility,
+    ) -> Self {
+        Self {
+            type_signature: TypeSignature::Uniform(arg_count, valid_types),
+            volatility,
+        }
+    }
+    /// exact - Creates a signture which must match the types in exact_types in order.
+    pub fn exact(exact_types: Vec<DataType>, volatility: Volatility) -> Self {
+        Signature {
+            type_signature: TypeSignature::Exact(exact_types),
+            volatility,
+        }
+    }
+    /// any - Creates a signature which can a be made of any type but of a specified number
+    pub fn any(arg_count: usize, volatility: Volatility) -> Self {
+        Signature {
+            type_signature: TypeSignature::Any(arg_count),
+            volatility,
+        }
+    }
+    /// one_of Creates a signature which can match any of the [TypeSignature]s which are passed in.
+    pub fn one_of(type_signatures: Vec<TypeSignature>, volatility: Volatility) -> Self {
+        Signature {
+            type_signature: TypeSignature::OneOf(type_signatures),
+            volatility,
+        }
+    }
+}
+
+///A function's volatility, which defines the functions eligibility for certain optimizations
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub enum Volatility {
+    /// Immutable - An immutable function will always return the same output when given the same input. An example of this is [BuiltinScalarFunction::Cos].
+    Immutable,
+    /// Stable - A stable function may return different values given the same input accross different queries but must return the same value for a given input within a query. An example of this is [BuiltinScalarFunction::Now].
+    Stable,
+    /// Volatile - A volatile function may change the return value from evaluation to evaluation. Mutiple invocations of a volatile function may return different results when used in the same query. An example of this is [BuiltinScalarFunction::Random].
+    Volatile,
 }
 
 /// Scalar function
@@ -109,6 +185,8 @@ pub enum BuiltinScalarFunction {
     Ceil,
     /// cos
     Cos,
+    /// Digest
+    Digest,
     /// exp
     Exp,
     /// floor
@@ -234,6 +312,79 @@ impl BuiltinScalarFunction {
             BuiltinScalarFunction::Random | BuiltinScalarFunction::Now
         )
     }
+    /// Returns the [Volatility] of the builtin function.
+    pub fn volatility(&self) -> Volatility {
+        match self {
+            //Immutable scalar builtins
+            BuiltinScalarFunction::Abs => Volatility::Immutable,
+            BuiltinScalarFunction::Acos => Volatility::Immutable,
+            BuiltinScalarFunction::Asin => Volatility::Immutable,
+            BuiltinScalarFunction::Atan => Volatility::Immutable,
+            BuiltinScalarFunction::Ceil => Volatility::Immutable,
+            BuiltinScalarFunction::Cos => Volatility::Immutable,
+            BuiltinScalarFunction::Exp => Volatility::Immutable,
+            BuiltinScalarFunction::Floor => Volatility::Immutable,
+            BuiltinScalarFunction::Ln => Volatility::Immutable,
+            BuiltinScalarFunction::Log => Volatility::Immutable,
+            BuiltinScalarFunction::Log10 => Volatility::Immutable,
+            BuiltinScalarFunction::Log2 => Volatility::Immutable,
+            BuiltinScalarFunction::Round => Volatility::Immutable,
+            BuiltinScalarFunction::Signum => Volatility::Immutable,
+            BuiltinScalarFunction::Sin => Volatility::Immutable,
+            BuiltinScalarFunction::Sqrt => Volatility::Immutable,
+            BuiltinScalarFunction::Tan => Volatility::Immutable,
+            BuiltinScalarFunction::Trunc => Volatility::Immutable,
+            BuiltinScalarFunction::Array => Volatility::Immutable,
+            BuiltinScalarFunction::Ascii => Volatility::Immutable,
+            BuiltinScalarFunction::BitLength => Volatility::Immutable,
+            BuiltinScalarFunction::Btrim => Volatility::Immutable,
+            BuiltinScalarFunction::CharacterLength => Volatility::Immutable,
+            BuiltinScalarFunction::Chr => Volatility::Immutable,
+            BuiltinScalarFunction::Concat => Volatility::Immutable,
+            BuiltinScalarFunction::ConcatWithSeparator => Volatility::Immutable,
+            BuiltinScalarFunction::DatePart => Volatility::Immutable,
+            BuiltinScalarFunction::DateTrunc => Volatility::Immutable,
+            BuiltinScalarFunction::InitCap => Volatility::Immutable,
+            BuiltinScalarFunction::Left => Volatility::Immutable,
+            BuiltinScalarFunction::Lpad => Volatility::Immutable,
+            BuiltinScalarFunction::Lower => Volatility::Immutable,
+            BuiltinScalarFunction::Ltrim => Volatility::Immutable,
+            BuiltinScalarFunction::MD5 => Volatility::Immutable,
+            BuiltinScalarFunction::NullIf => Volatility::Immutable,
+            BuiltinScalarFunction::OctetLength => Volatility::Immutable,
+            BuiltinScalarFunction::RegexpReplace => Volatility::Immutable,
+            BuiltinScalarFunction::Repeat => Volatility::Immutable,
+            BuiltinScalarFunction::Replace => Volatility::Immutable,
+            BuiltinScalarFunction::Reverse => Volatility::Immutable,
+            BuiltinScalarFunction::Right => Volatility::Immutable,
+            BuiltinScalarFunction::Rpad => Volatility::Immutable,
+            BuiltinScalarFunction::Rtrim => Volatility::Immutable,
+            BuiltinScalarFunction::SHA224 => Volatility::Immutable,
+            BuiltinScalarFunction::SHA256 => Volatility::Immutable,
+            BuiltinScalarFunction::SHA384 => Volatility::Immutable,
+            BuiltinScalarFunction::SHA512 => Volatility::Immutable,
+            BuiltinScalarFunction::Digest => Volatility::Immutable,
+            BuiltinScalarFunction::SplitPart => Volatility::Immutable,
+            BuiltinScalarFunction::StartsWith => Volatility::Immutable,
+            BuiltinScalarFunction::Strpos => Volatility::Immutable,
+            BuiltinScalarFunction::Substr => Volatility::Immutable,
+            BuiltinScalarFunction::ToHex => Volatility::Immutable,
+            BuiltinScalarFunction::ToTimestamp => Volatility::Immutable,
+            BuiltinScalarFunction::ToTimestampMillis => Volatility::Immutable,
+            BuiltinScalarFunction::ToTimestampMicros => Volatility::Immutable,
+            BuiltinScalarFunction::ToTimestampSeconds => Volatility::Immutable,
+            BuiltinScalarFunction::Translate => Volatility::Immutable,
+            BuiltinScalarFunction::Trim => Volatility::Immutable,
+            BuiltinScalarFunction::Upper => Volatility::Immutable,
+            BuiltinScalarFunction::RegexpMatch => Volatility::Immutable,
+
+            //Stable builtin functions
+            BuiltinScalarFunction::Now => Volatility::Stable,
+
+            //Volatile builtin functions
+            BuiltinScalarFunction::Random => Volatility::Volatile,
+        }
+    }
 }
 
 impl fmt::Display for BuiltinScalarFunction {
@@ -300,6 +451,7 @@ impl FromStr for BuiltinScalarFunction {
             "sha256" => BuiltinScalarFunction::SHA256,
             "sha384" => BuiltinScalarFunction::SHA384,
             "sha512" => BuiltinScalarFunction::SHA512,
+            "digest" => BuiltinScalarFunction::Digest,
             "split_part" => BuiltinScalarFunction::SplitPart,
             "starts_with" => BuiltinScalarFunction::StartsWith,
             "strpos" => BuiltinScalarFunction::Strpos,
@@ -354,6 +506,13 @@ pub fn return_type(
     // Note that this function *must* return the same type that the respective physical expression returns
     // or the execution panics.
 
+    if arg_types.is_empty() && !fun.supports_zero_argument() {
+        return Err(DataFusionError::Internal(format!(
+            "Builtin scalar function {} does not support empty arguments",
+            fun
+        )));
+    }
+
     // verify that this is a valid set of data types for this function
     data_types(arg_types, &signature(fun))?;
 
@@ -405,6 +564,7 @@ pub fn return_type(
         BuiltinScalarFunction::SHA256 => utf8_to_binary_type(&arg_types[0], "sha256"),
         BuiltinScalarFunction::SHA384 => utf8_to_binary_type(&arg_types[0], "sha384"),
         BuiltinScalarFunction::SHA512 => utf8_to_binary_type(&arg_types[0], "sha512"),
+        BuiltinScalarFunction::Digest => utf8_to_binary_type(&arg_types[0], "digest"),
         BuiltinScalarFunction::SplitPart => utf8_to_str_type(&arg_types[0], "split_part"),
         BuiltinScalarFunction::StartsWith => Ok(DataType::Boolean),
         BuiltinScalarFunction::Strpos => utf8_to_int_type(&arg_types[0], "strpos"),
@@ -468,18 +628,10 @@ pub fn return_type(
         | BuiltinScalarFunction::Sin
         | BuiltinScalarFunction::Sqrt
         | BuiltinScalarFunction::Tan
-        | BuiltinScalarFunction::Trunc => {
-            if arg_types.is_empty() {
-                return Err(DataFusionError::Internal(format!(
-                    "builtin scalar function {} does not support empty arguments",
-                    fun
-                )));
-            }
-            match arg_types[0] {
-                DataType::Float32 => Ok(DataType::Float32),
-                _ => Ok(DataType::Float64),
-            }
-        }
+        | BuiltinScalarFunction::Trunc => match arg_types[0] {
+            DataType::Float32 => Ok(DataType::Float32),
+            _ => Ok(DataType::Float64),
+        },
     }
 }
 
@@ -701,6 +853,9 @@ pub fn create_physical_fun(
         }),
         BuiltinScalarFunction::MD5 => {
             Arc::new(invoke_if_crypto_expressions_feature_flag!(md5, "md5"))
+        }
+        BuiltinScalarFunction::Digest => {
+            Arc::new(invoke_if_crypto_expressions_feature_flag!(digest, "digest"))
         }
         BuiltinScalarFunction::NullIf => Arc::new(nullif_func),
         BuiltinScalarFunction::OctetLength => Arc::new(|args| match &args[0] {
@@ -979,6 +1134,15 @@ pub fn create_physical_expr(
     input_schema: &Schema,
     ctx_state: &ExecutionContextState,
 ) -> Result<Arc<dyn PhysicalExpr>> {
+    let args = coerce(args, input_schema, &signature(fun))?;
+
+    let arg_types = args
+        .iter()
+        .map(|e| e.data_type(input_schema))
+        .collect::<Result<Vec<_>>>()?;
+
+    let data_type = return_type(fun, &arg_types)?;
+
     let fun_expr: ScalarFunctionImplementation = match fun {
         // These functions need args and input schema to pick an implementation
         // Unlike the string functions, which actually figure out the function to use with each array,
@@ -1067,18 +1231,12 @@ pub fn create_physical_expr(
         // These don't need args and input schema
         _ => create_physical_fun(fun, ctx_state)?,
     };
-    let args = coerce(args, input_schema, &signature(fun))?;
-
-    let arg_types = args
-        .iter()
-        .map(|e| e.data_type(input_schema))
-        .collect::<Result<Vec<_>>>()?;
 
     Ok(Arc::new(ScalarFunctionExpr::new(
         &format!("{}", fun),
         fun_expr,
         args,
-        &return_type(fun, &arg_types)?,
+        &data_type,
     )))
 }
 
@@ -1088,11 +1246,12 @@ fn signature(fun: &BuiltinScalarFunction) -> Signature {
 
     // for now, the list is small, as we do not have many built-in functions.
     match fun {
-        BuiltinScalarFunction::Array => {
-            Signature::Variadic(array_expressions::SUPPORTED_ARRAY_TYPES.to_vec())
-        }
+        BuiltinScalarFunction::Array => Signature::variadic(
+            array_expressions::SUPPORTED_ARRAY_TYPES.to_vec(),
+            fun.volatility(),
+        ),
         BuiltinScalarFunction::Concat | BuiltinScalarFunction::ConcatWithSeparator => {
-            Signature::Variadic(vec![DataType::Utf8])
+            Signature::variadic(vec![DataType::Utf8], fun.volatility())
         }
         BuiltinScalarFunction::Ascii
         | BuiltinScalarFunction::BitLength
@@ -1107,47 +1266,60 @@ fn signature(fun: &BuiltinScalarFunction) -> Signature {
         | BuiltinScalarFunction::SHA384
         | BuiltinScalarFunction::SHA512
         | BuiltinScalarFunction::Trim
-        | BuiltinScalarFunction::Upper => {
-            Signature::Uniform(1, vec![DataType::Utf8, DataType::LargeUtf8])
-        }
+        | BuiltinScalarFunction::Upper => Signature::uniform(
+            1,
+            vec![DataType::Utf8, DataType::LargeUtf8],
+            fun.volatility(),
+        ),
         BuiltinScalarFunction::Btrim
         | BuiltinScalarFunction::Ltrim
-        | BuiltinScalarFunction::Rtrim => Signature::OneOf(vec![
-            Signature::Exact(vec![DataType::Utf8]),
-            Signature::Exact(vec![DataType::Utf8, DataType::Utf8]),
-        ]),
+        | BuiltinScalarFunction::Rtrim => Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+            ],
+            fun.volatility(),
+        ),
         BuiltinScalarFunction::Chr | BuiltinScalarFunction::ToHex => {
-            Signature::Uniform(1, vec![DataType::Int64])
+            Signature::uniform(1, vec![DataType::Int64], fun.volatility())
         }
-        BuiltinScalarFunction::Lpad | BuiltinScalarFunction::Rpad => {
-            Signature::OneOf(vec![
-                Signature::Exact(vec![DataType::Utf8, DataType::Int64]),
-                Signature::Exact(vec![DataType::LargeUtf8, DataType::Int64]),
-                Signature::Exact(vec![DataType::Utf8, DataType::Int64, DataType::Utf8]),
-                Signature::Exact(vec![
+        BuiltinScalarFunction::Lpad | BuiltinScalarFunction::Rpad => Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::Int64]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Int64,
+                    DataType::Utf8,
+                ]),
+                TypeSignature::Exact(vec![
                     DataType::LargeUtf8,
                     DataType::Int64,
                     DataType::Utf8,
                 ]),
-                Signature::Exact(vec![
+                TypeSignature::Exact(vec![
                     DataType::Utf8,
                     DataType::Int64,
                     DataType::LargeUtf8,
                 ]),
-                Signature::Exact(vec![
+                TypeSignature::Exact(vec![
                     DataType::LargeUtf8,
                     DataType::Int64,
                     DataType::LargeUtf8,
                 ]),
-            ])
-        }
+            ],
+            fun.volatility(),
+        ),
         BuiltinScalarFunction::Left
         | BuiltinScalarFunction::Repeat
-        | BuiltinScalarFunction::Right => Signature::OneOf(vec![
-            Signature::Exact(vec![DataType::Utf8, DataType::Int64]),
-            Signature::Exact(vec![DataType::LargeUtf8, DataType::Int64]),
-        ]),
-        BuiltinScalarFunction::ToTimestamp => Signature::Uniform(
+        | BuiltinScalarFunction::Right => Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::Int64]),
+            ],
+            fun.volatility(),
+        ),
+        BuiltinScalarFunction::ToTimestamp => Signature::uniform(
             1,
             vec![
                 DataType::Utf8,
@@ -1156,8 +1328,9 @@ fn signature(fun: &BuiltinScalarFunction) -> Signature {
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 DataType::Timestamp(TimeUnit::Second, None),
             ],
+            fun.volatility(),
         ),
-        BuiltinScalarFunction::ToTimestampMillis => Signature::Uniform(
+        BuiltinScalarFunction::ToTimestampMillis => Signature::uniform(
             1,
             vec![
                 DataType::Utf8,
@@ -1166,8 +1339,9 @@ fn signature(fun: &BuiltinScalarFunction) -> Signature {
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 DataType::Timestamp(TimeUnit::Second, None),
             ],
+            fun.volatility(),
         ),
-        BuiltinScalarFunction::ToTimestampMicros => Signature::Uniform(
+        BuiltinScalarFunction::ToTimestampMicros => Signature::uniform(
             1,
             vec![
                 DataType::Utf8,
@@ -1176,8 +1350,9 @@ fn signature(fun: &BuiltinScalarFunction) -> Signature {
                 DataType::Timestamp(TimeUnit::Millisecond, None),
                 DataType::Timestamp(TimeUnit::Second, None),
             ],
+            fun.volatility(),
         ),
-        BuiltinScalarFunction::ToTimestampSeconds => Signature::Uniform(
+        BuiltinScalarFunction::ToTimestampSeconds => Signature::uniform(
             1,
             vec![
                 DataType::Utf8,
@@ -1186,91 +1361,155 @@ fn signature(fun: &BuiltinScalarFunction) -> Signature {
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 DataType::Timestamp(TimeUnit::Millisecond, None),
             ],
+            fun.volatility(),
         ),
-        BuiltinScalarFunction::DateTrunc => Signature::Exact(vec![
-            DataType::Utf8,
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-        ]),
-        BuiltinScalarFunction::DatePart => Signature::OneOf(vec![
-            Signature::Exact(vec![DataType::Utf8, DataType::Date32]),
-            Signature::Exact(vec![DataType::Utf8, DataType::Date64]),
-            Signature::Exact(vec![
-                DataType::Utf8,
-                DataType::Timestamp(TimeUnit::Second, None),
-            ]),
-            Signature::Exact(vec![
-                DataType::Utf8,
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-            ]),
-            Signature::Exact(vec![
-                DataType::Utf8,
-                DataType::Timestamp(TimeUnit::Millisecond, None),
-            ]),
-            Signature::Exact(vec![
+        BuiltinScalarFunction::Digest => {
+            Signature::exact(vec![DataType::Utf8, DataType::Utf8], fun.volatility())
+        }
+        BuiltinScalarFunction::DateTrunc => Signature::exact(
+            vec![
                 DataType::Utf8,
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
-            ]),
-        ]),
-        BuiltinScalarFunction::SplitPart => Signature::OneOf(vec![
-            Signature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Int64]),
-            Signature::Exact(vec![DataType::LargeUtf8, DataType::Utf8, DataType::Int64]),
-            Signature::Exact(vec![DataType::Utf8, DataType::LargeUtf8, DataType::Int64]),
-            Signature::Exact(vec![
-                DataType::LargeUtf8,
-                DataType::LargeUtf8,
-                DataType::Int64,
-            ]),
-        ]),
+            ],
+            fun.volatility(),
+        ),
+        BuiltinScalarFunction::DatePart => Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Date32]),
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Date64]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Timestamp(TimeUnit::Second, None),
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                ]),
+            ],
+            fun.volatility(),
+        ),
+        BuiltinScalarFunction::SplitPart => Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Int64,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::LargeUtf8,
+                    DataType::Utf8,
+                    DataType::Int64,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::LargeUtf8,
+                    DataType::Int64,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::LargeUtf8,
+                    DataType::LargeUtf8,
+                    DataType::Int64,
+                ]),
+            ],
+            fun.volatility(),
+        ),
 
         BuiltinScalarFunction::Strpos | BuiltinScalarFunction::StartsWith => {
-            Signature::OneOf(vec![
-                Signature::Exact(vec![DataType::Utf8, DataType::Utf8]),
-                Signature::Exact(vec![DataType::Utf8, DataType::LargeUtf8]),
-                Signature::Exact(vec![DataType::LargeUtf8, DataType::Utf8]),
-                Signature::Exact(vec![DataType::LargeUtf8, DataType::LargeUtf8]),
-            ])
+            Signature::one_of(
+                vec![
+                    TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+                    TypeSignature::Exact(vec![DataType::Utf8, DataType::LargeUtf8]),
+                    TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::Utf8]),
+                    TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::LargeUtf8]),
+                ],
+                fun.volatility(),
+            )
         }
 
-        BuiltinScalarFunction::Substr => Signature::OneOf(vec![
-            Signature::Exact(vec![DataType::Utf8, DataType::Int64]),
-            Signature::Exact(vec![DataType::LargeUtf8, DataType::Int64]),
-            Signature::Exact(vec![DataType::Utf8, DataType::Int64, DataType::Int64]),
-            Signature::Exact(vec![DataType::LargeUtf8, DataType::Int64, DataType::Int64]),
-        ]),
+        BuiltinScalarFunction::Substr => Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Int64]),
+                TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::Int64]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Int64,
+                    DataType::Int64,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::LargeUtf8,
+                    DataType::Int64,
+                    DataType::Int64,
+                ]),
+            ],
+            fun.volatility(),
+        ),
 
         BuiltinScalarFunction::Replace | BuiltinScalarFunction::Translate => {
-            Signature::OneOf(vec![Signature::Exact(vec![
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Utf8,
-            ])])
+            Signature::one_of(
+                vec![TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                ])],
+                fun.volatility(),
+            )
         }
-        BuiltinScalarFunction::RegexpReplace => Signature::OneOf(vec![
-            Signature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]),
-            Signature::Exact(vec![
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Utf8,
-                DataType::Utf8,
-            ]),
-        ]),
+        BuiltinScalarFunction::RegexpReplace => Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                ]),
+            ],
+            fun.volatility(),
+        ),
 
         BuiltinScalarFunction::NullIf => {
-            Signature::Uniform(2, SUPPORTED_NULLIF_TYPES.to_vec())
+            Signature::uniform(2, SUPPORTED_NULLIF_TYPES.to_vec(), fun.volatility())
         }
-        BuiltinScalarFunction::RegexpMatch => Signature::OneOf(vec![
-            Signature::Exact(vec![DataType::Utf8, DataType::Utf8]),
-            Signature::Exact(vec![DataType::LargeUtf8, DataType::Utf8]),
-            Signature::Exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8]),
-            Signature::Exact(vec![DataType::LargeUtf8, DataType::Utf8, DataType::Utf8]),
-        ]),
-        BuiltinScalarFunction::Random => Signature::Exact(vec![]),
+        BuiltinScalarFunction::RegexpMatch => Signature::one_of(
+            vec![
+                TypeSignature::Exact(vec![DataType::Utf8, DataType::Utf8]),
+                TypeSignature::Exact(vec![DataType::LargeUtf8, DataType::Utf8]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::LargeUtf8,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                ]),
+            ],
+            fun.volatility(),
+        ),
+        BuiltinScalarFunction::Random => Signature::exact(vec![], fun.volatility()),
         // math expressions expect 1 argument of type f64 or f32
         // priority is given to f64 because e.g. `sqrt(1i32)` is in IR (real numbers) and thus we
         // return the best approximation for it (in f64).
         // We accept f32 because in this case it is clear that the best approximation
         // will be as good as the number of digits in the number
-        _ => Signature::Uniform(1, vec![DataType::Float64, DataType::Float32]),
+        _ => Signature::uniform(
+            1,
+            vec![DataType::Float64, DataType::Float32],
+            fun.volatility(),
+        ),
     }
 }
 
@@ -3622,28 +3861,59 @@ mod tests {
     }
 
     #[test]
-    fn test_concat_error() -> Result<()> {
+    fn test_empty_arguments_error() -> Result<()> {
         let ctx_state = ExecutionContextState::new();
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
 
-        let expr = create_physical_expr(
-            &BuiltinScalarFunction::Concat,
-            &[],
-            &schema,
-            &ctx_state,
-        )?;
+        // pick some arbitrary functions to test
+        let funs = [
+            BuiltinScalarFunction::Concat,
+            BuiltinScalarFunction::ToTimestamp,
+            BuiltinScalarFunction::Abs,
+            BuiltinScalarFunction::Repeat,
+        ];
 
-        let columns: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![1]))];
-        let batch = RecordBatch::try_new(Arc::new(schema.clone()), columns)?;
-        let result = expr.evaluate(&batch);
+        for fun in funs.iter() {
+            let expr = create_physical_expr(fun, &[], &schema, &ctx_state);
 
-        if result.is_ok() {
-            Err(DataFusionError::Plan(
-                "Function 'concat' cannot accept zero arguments".to_string(),
-            ))
-        } else {
-            Ok(())
+            match expr {
+                Ok(..) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "Builtin scalar function {} does not support empty arguments",
+                        fun
+                    )));
+                }
+                Err(DataFusionError::Internal(err)) => {
+                    if err
+                        != format!(
+                            "Builtin scalar function {} does not support empty arguments",
+                            fun
+                        )
+                    {
+                        return Err(DataFusionError::Internal(format!(
+                            "Builtin scalar function {} didn't got the right error message with empty arguments", fun)));
+                    }
+                }
+                Err(..) => {
+                    return Err(DataFusionError::Internal(format!(
+                        "Builtin scalar function {} didn't got the right error with empty arguments", fun)));
+                }
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_arguments() -> Result<()> {
+        let ctx_state = ExecutionContextState::new();
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+
+        let funs = [BuiltinScalarFunction::Now, BuiltinScalarFunction::Random];
+
+        for fun in funs.iter() {
+            create_physical_expr(fun, &[], &schema, &ctx_state)?;
+        }
+        Ok(())
     }
 
     fn generic_test_array(

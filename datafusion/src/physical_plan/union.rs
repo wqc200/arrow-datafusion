@@ -218,11 +218,13 @@ fn stats_union(mut left: Statistics, right: Statistics) -> Statistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datasource::object_store::{local::LocalFileSystem, ObjectStore};
     use crate::test;
+
     use crate::{
         physical_plan::{
             collect,
-            csv::{CsvExec, CsvReadOptions},
+            file_format::{CsvExec, PhysicalPlanConfig},
         },
         scalar::ScalarValue,
     };
@@ -231,26 +233,41 @@ mod tests {
     #[tokio::test]
     async fn test_union_partitions() -> Result<()> {
         let schema = test::aggr_test_schema();
+        let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem {});
 
         // Create csv's with different partitioning
-        let path = test::create_partitioned_csv("aggregate_test_100.csv", 4)?;
-        let path2 = test::create_partitioned_csv("aggregate_test_100.csv", 5)?;
+        let (_, files) = test::create_partitioned_csv("aggregate_test_100.csv", 4)?;
+        let (_, files2) = test::create_partitioned_csv("aggregate_test_100.csv", 5)?;
 
-        let csv = CsvExec::try_new(
-            &path,
-            CsvReadOptions::new().schema(&schema),
-            None,
-            1024,
-            None,
-        )?;
+        let csv = CsvExec::new(
+            PhysicalPlanConfig {
+                object_store: Arc::clone(&fs),
+                file_schema: Arc::clone(&schema),
+                file_groups: files,
+                statistics: Statistics::default(),
+                projection: None,
+                batch_size: 1024,
+                limit: None,
+                table_partition_cols: vec![],
+            },
+            true,
+            b',',
+        );
 
-        let csv2 = CsvExec::try_new(
-            &path2,
-            CsvReadOptions::new().schema(&schema),
-            None,
-            1024,
-            None,
-        )?;
+        let csv2 = CsvExec::new(
+            PhysicalPlanConfig {
+                object_store: Arc::clone(&fs),
+                file_schema: Arc::clone(&schema),
+                file_groups: files2,
+                statistics: Statistics::default(),
+                projection: None,
+                batch_size: 1024,
+                limit: None,
+                table_partition_cols: vec![],
+            },
+            true,
+            b',',
+        );
 
         let union_exec = Arc::new(UnionExec::new(vec![Arc::new(csv), Arc::new(csv2)]));
 

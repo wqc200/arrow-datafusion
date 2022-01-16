@@ -27,7 +27,7 @@
 //! * Return type: a function `(arg_types) -> return_type`. E.g. for min, ([f32]) -> f32, ([f64]) -> f64.
 
 use super::{
-    functions::Signature,
+    functions::{Signature, Volatility},
     type_coercion::{coerce, data_types},
     Accumulator, AggregateExpr, PhysicalExpr,
 };
@@ -59,6 +59,8 @@ pub enum AggregateFunction {
     Max,
     /// avg
     Avg,
+    /// Approximate aggregate function
+    ApproxDistinct,
 }
 
 impl fmt::Display for AggregateFunction {
@@ -77,6 +79,7 @@ impl FromStr for AggregateFunction {
             "count" => AggregateFunction::Count,
             "avg" => AggregateFunction::Avg,
             "sum" => AggregateFunction::Sum,
+            "approx_distinct" => AggregateFunction::ApproxDistinct,
             _ => {
                 return Err(DataFusionError::Plan(format!(
                     "There is no built-in function named {}",
@@ -96,7 +99,9 @@ pub fn return_type(fun: &AggregateFunction, arg_types: &[DataType]) -> Result<Da
     data_types(arg_types, &signature(fun))?;
 
     match fun {
-        AggregateFunction::Count => Ok(DataType::UInt64),
+        AggregateFunction::Count | AggregateFunction::ApproxDistinct => {
+            Ok(DataType::UInt64)
+        }
         AggregateFunction::Max | AggregateFunction::Min => Ok(arg_types[0].clone()),
         AggregateFunction::Sum => sum_return_type(&arg_types[0]),
         AggregateFunction::Avg => avg_return_type(&arg_types[0]),
@@ -149,6 +154,9 @@ pub fn create_aggregate_expr(
                 "SUM(DISTINCT) aggregations are not available".to_string(),
             ));
         }
+        (AggregateFunction::ApproxDistinct, _) => Arc::new(
+            expressions::ApproxDistinct::new(arg, name, arg_types[0].clone()),
+        ),
         (AggregateFunction::Min, _) => {
             Arc::new(expressions::Min::new(arg, name, return_type))
         }
@@ -194,7 +202,9 @@ static DATES: &[DataType] = &[DataType::Date32, DataType::Date64];
 pub fn signature(fun: &AggregateFunction) -> Signature {
     // note: the physical expression must accept the type returned by this function or the execution panics.
     match fun {
-        AggregateFunction::Count => Signature::Any(1),
+        AggregateFunction::Count | AggregateFunction::ApproxDistinct => {
+            Signature::any(1, Volatility::Immutable)
+        }
         AggregateFunction::Min | AggregateFunction::Max => {
             let valid = STRINGS
                 .iter()
@@ -203,10 +213,10 @@ pub fn signature(fun: &AggregateFunction) -> Signature {
                 .chain(DATES.iter())
                 .cloned()
                 .collect::<Vec<_>>();
-            Signature::Uniform(1, valid)
+            Signature::uniform(1, valid, Volatility::Immutable)
         }
         AggregateFunction::Avg | AggregateFunction::Sum => {
-            Signature::Uniform(1, NUMERICS.to_vec())
+            Signature::uniform(1, NUMERICS.to_vec(), Volatility::Immutable)
         }
     }
 }

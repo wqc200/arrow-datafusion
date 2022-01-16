@@ -81,14 +81,9 @@ fn optimize(plan: &LogicalPlan, execution_props: &ExecutionProps) -> Result<Logi
             expr,
             input,
             schema,
+            alias,
         } => {
-            let mut arrays = vec![];
-            for e in expr {
-                let data_type = e.get_type(input.schema())?;
-                let mut id_array = vec![];
-                expr_to_identifier(e, &mut expr_set, &mut id_array, data_type)?;
-                arrays.push(id_array);
-            }
+            let arrays = to_arrays(expr, input, &mut expr_set)?;
 
             let (mut new_expr, new_input) = rewrite_expr(
                 &[expr],
@@ -103,6 +98,7 @@ fn optimize(plan: &LogicalPlan, execution_props: &ExecutionProps) -> Result<Logi
                 expr: new_expr.pop().unwrap(),
                 input: Arc::new(new_input),
                 schema: schema.clone(),
+                alias: alias.clone(),
             })
         }
         LogicalPlan::Filter { predicate, input } => {
@@ -136,13 +132,7 @@ fn optimize(plan: &LogicalPlan, execution_props: &ExecutionProps) -> Result<Logi
             window_expr,
             schema,
         } => {
-            let mut arrays = vec![];
-            for e in window_expr {
-                let data_type = e.get_type(input.schema())?;
-                let mut id_array = vec![];
-                expr_to_identifier(e, &mut expr_set, &mut id_array, data_type)?;
-                arrays.push(id_array);
-            }
+            let arrays = to_arrays(window_expr, input, &mut expr_set)?;
 
             let (mut new_expr, new_input) = rewrite_expr(
                 &[window_expr],
@@ -165,20 +155,8 @@ fn optimize(plan: &LogicalPlan, execution_props: &ExecutionProps) -> Result<Logi
             aggr_expr,
             schema,
         } => {
-            let mut group_arrays = vec![];
-            for e in group_expr {
-                let data_type = e.get_type(input.schema())?;
-                let mut id_array = vec![];
-                expr_to_identifier(e, &mut expr_set, &mut id_array, data_type)?;
-                group_arrays.push(id_array);
-            }
-            let mut aggr_arrays = vec![];
-            for e in aggr_expr {
-                let data_type = e.get_type(input.schema())?;
-                let mut id_array = vec![];
-                expr_to_identifier(e, &mut expr_set, &mut id_array, data_type)?;
-                aggr_arrays.push(id_array);
-            }
+            let group_arrays = to_arrays(group_expr, input, &mut expr_set)?;
+            let aggr_arrays = to_arrays(aggr_expr, input, &mut expr_set)?;
 
             let (mut new_expr, new_input) = rewrite_expr(
                 &[group_expr, aggr_expr],
@@ -200,13 +178,7 @@ fn optimize(plan: &LogicalPlan, execution_props: &ExecutionProps) -> Result<Logi
             })
         }
         LogicalPlan::Sort { expr, input } => {
-            let mut arrays = vec![];
-            for e in expr {
-                let data_type = e.get_type(input.schema())?;
-                let mut id_array = vec![];
-                expr_to_identifier(e, &mut expr_set, &mut id_array, data_type)?;
-                arrays.push(id_array);
-            }
+            let arrays = to_arrays(expr, input, &mut expr_set)?;
 
             let (mut new_expr, new_input) = rewrite_expr(
                 &[expr],
@@ -227,11 +199,14 @@ fn optimize(plan: &LogicalPlan, execution_props: &ExecutionProps) -> Result<Logi
         | LogicalPlan::Repartition { .. }
         | LogicalPlan::Union { .. }
         | LogicalPlan::TableScan { .. }
+        | LogicalPlan::Values { .. }
         | LogicalPlan::EmptyRelation { .. }
         | LogicalPlan::Limit { .. }
         | LogicalPlan::CreateExternalTable { .. }
         | LogicalPlan::Explain { .. }
         | LogicalPlan::Analyze { .. }
+        | LogicalPlan::CreateMemoryTable { .. }
+        | LogicalPlan::DropTable { .. }
         | LogicalPlan::Extension { .. } => {
             // apply the optimization to all inputs of the plan
             let expr = plan.expressions();
@@ -244,6 +219,22 @@ fn optimize(plan: &LogicalPlan, execution_props: &ExecutionProps) -> Result<Logi
             utils::from_plan(plan, &expr, &new_inputs)
         }
     }
+}
+
+fn to_arrays(
+    expr: &[Expr],
+    input: &LogicalPlan,
+    mut expr_set: &mut ExprSet,
+) -> Result<Vec<Vec<(usize, String)>>> {
+    expr.iter()
+        .map(|e| {
+            let data_type = e.get_type(input.schema())?;
+            let mut id_array = vec![];
+            expr_to_identifier(e, &mut expr_set, &mut id_array, data_type)?;
+
+            Ok(id_array)
+        })
+        .collect::<Result<Vec<_>>>()
 }
 
 /// Build the "intermediate" projection plan that evaluates the extracted common expressions.
@@ -268,7 +259,7 @@ fn build_project_plan(
 
     fields.extend_from_slice(input.schema().fields());
     input.schema().fields().iter().for_each(|field| {
-        project_exprs.push(col(&field.qualified_name()));
+        project_exprs.push(Expr::Column(field.qualified_column()));
     });
 
     let mut schema = DFSchema::new(fields)?;
@@ -278,6 +269,7 @@ fn build_project_plan(
         expr: project_exprs,
         input: Arc::new(input),
         schema: Arc::new(schema),
+        alias: None,
     })
 }
 
@@ -451,6 +443,10 @@ impl ExprIdentifierVisitor<'_> {
             }
             Expr::Wildcard => {
                 desc.push_str("Wildcard-");
+            }
+            Expr::GetIndexedField { key, .. } => {
+                desc.push_str("GetIndexedField-");
+                desc.push_str(&key.to_string());
             }
         }
 
@@ -637,6 +633,7 @@ mod test {
         avg, binary_expr, col, lit, sum, LogicalPlanBuilder, Operator,
     };
     use crate::test::*;
+    use std::iter;
 
     fn assert_optimized_plan_eq(plan: &LogicalPlan, expected: &str) {
         let optimizer = CommonSubexprEliminate {};
@@ -694,7 +691,7 @@ mod test {
 
         let plan = LogicalPlanBuilder::from(table_scan)
             .aggregate(
-                vec![],
+                iter::empty::<Expr>(),
                 vec![
                     sum(binary_expr(
                         col("a"),
@@ -714,8 +711,8 @@ mod test {
             )?
             .build()?;
 
-        let expected = "Aggregate: groupBy=[[]], aggr=[[SUM(#BinaryExpr-*BinaryExpr--Column-test.bLiteral1Column-test.a AS test.a Multiply Int32(1) Minus test.b), SUM(#BinaryExpr-*BinaryExpr--Column-test.bLiteral1Column-test.a AS test.a Multiply Int32(1) Minus test.b Multiply Int32(1) Plus #test.c)]]\
-        \n  Projection: #test.a Multiply Int32(1) Minus #test.b AS BinaryExpr-*BinaryExpr--Column-test.bLiteral1Column-test.a, #test.a, #test.b, #test.c\
+        let expected = "Aggregate: groupBy=[[]], aggr=[[SUM(#BinaryExpr-*BinaryExpr--Column-test.bLiteral1Column-test.a AS test.a * Int32(1) - test.b), SUM(#BinaryExpr-*BinaryExpr--Column-test.bLiteral1Column-test.a AS test.a * Int32(1) - test.b * Int32(1) + #test.c)]]\
+        \n  Projection: #test.a * Int32(1) - #test.b AS BinaryExpr-*BinaryExpr--Column-test.bLiteral1Column-test.a, #test.a, #test.b, #test.c\
         \n    TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -729,7 +726,7 @@ mod test {
 
         let plan = LogicalPlanBuilder::from(table_scan)
             .aggregate(
-                vec![],
+                iter::empty::<Expr>(),
                 vec![
                     binary_expr(lit(1), Operator::Plus, avg(col("a"))),
                     binary_expr(lit(1), Operator::Minus, avg(col("a"))),
@@ -737,7 +734,7 @@ mod test {
             )?
             .build()?;
 
-        let expected = "Aggregate: groupBy=[[]], aggr=[[Int32(1) Plus #AggregateFunction-AVGfalseColumn-test.a AS AVG(test.a), Int32(1) Minus #AggregateFunction-AVGfalseColumn-test.a AS AVG(test.a)]]\
+        let expected = "Aggregate: groupBy=[[]], aggr=[[Int32(1) + #AggregateFunction-AVGfalseColumn-test.a AS AVG(test.a), Int32(1) - #AggregateFunction-AVGfalseColumn-test.a AS AVG(test.a)]]\
         \n  Projection: AVG(#test.a) AS AggregateFunction-AVGfalseColumn-test.a, #test.a, #test.b, #test.c\
         \n    TableScan: test projection=None";
 
@@ -757,8 +754,8 @@ mod test {
             ])?
             .build()?;
 
-        let expected = "Projection: #BinaryExpr-+Column-test.aLiteral1 AS Int32(1) Plus test.a AS first, #BinaryExpr-+Column-test.aLiteral1 AS Int32(1) Plus test.a AS second\
-        \n  Projection: Int32(1) Plus #test.a AS BinaryExpr-+Column-test.aLiteral1, #test.a, #test.b, #test.c\
+        let expected = "Projection: #BinaryExpr-+Column-test.aLiteral1 AS Int32(1) + test.a AS first, #BinaryExpr-+Column-test.aLiteral1 AS Int32(1) + test.a AS second\
+        \n  Projection: Int32(1) + #test.a AS BinaryExpr-+Column-test.aLiteral1, #test.a, #test.b, #test.c\
         \n    TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -777,7 +774,7 @@ mod test {
             ])?
             .build()?;
 
-        let expected = "Projection: Int32(1) Plus #test.a, #test.a Plus Int32(1)\
+        let expected = "Projection: Int32(1) + #test.a, #test.a + Int32(1)\
         \n  TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
@@ -794,8 +791,8 @@ mod test {
             .project(vec![binary_expr(lit(1), Operator::Plus, col("a"))])?
             .build()?;
 
-        let expected = "Projection: #Int32(1) Plus test.a\
-        \n  Projection: Int32(1) Plus #test.a\
+        let expected = "Projection: #Int32(1) + test.a\
+        \n  Projection: Int32(1) + #test.a\
         \n    TableScan: test projection=None";
 
         assert_optimized_plan_eq(&plan, expected);
