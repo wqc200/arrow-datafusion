@@ -150,6 +150,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 external: false,
                 if_not_exists: false,
                 without_rowid: _without_row_id,
+                table_options,
             } if columns.is_empty()
                 && constraints.is_empty()
                 && table_properties.is_empty()
@@ -999,7 +1000,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     /// Wrap the logical in a sort
-    fn order_by(
+    pub fn order_by(
         &self,
         plan: LogicalPlan,
         order_by: &[OrderByExpr],
@@ -1239,7 +1240,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         LogicalPlanBuilder::values(values)?.build()
     }
 
-    fn sql_expr_to_logical_expr(&self, sql: &SQLExpr, schema: &DFSchema) -> Result<Expr> {
+     pub fn sql_expr_to_logical_expr(&self, sql: &SQLExpr, schema: &DFSchema) -> Result<Expr> {
         match sql {
             SQLExpr::Value(Value::Number(n, _)) => parse_sql_number(n),
             SQLExpr::Value(Value::SingleQuotedString(ref s)) => Ok(lit(s.clone())),
