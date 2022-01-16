@@ -17,7 +17,8 @@
 
 //! Common unit test utility methods
 
-use crate::datasource::{MemTable, TableProvider};
+use crate::datasource::object_store::local::local_unpartitioned_file;
+use crate::datasource::{MemTable, PartitionedFile, TableProvider};
 use crate::error::Result;
 use crate::logical_plan::{LogicalPlan, LogicalPlanBuilder};
 use array::{
@@ -27,9 +28,11 @@ use array::{
 use arrow::array::{self, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use futures::{Future, FutureExt};
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter};
+use std::pin::Pin;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -51,19 +54,24 @@ pub fn create_table_dual() -> Arc<dyn TableProvider> {
 }
 
 /// Generated partitioned copy of a CSV file
-pub fn create_partitioned_csv(filename: &str, partitions: usize) -> Result<String> {
+pub fn create_partitioned_csv(
+    filename: &str,
+    partitions: usize,
+) -> Result<(String, Vec<Vec<PartitionedFile>>)> {
     let testdata = crate::test_util::arrow_test_data();
     let path = format!("{}/csv/{}", testdata, filename);
 
     let tmp_dir = TempDir::new()?;
 
     let mut writers = vec![];
+    let mut files = vec![];
     for i in 0..partitions {
         let filename = format!("partition-{}.csv", i);
         let filename = tmp_dir.path().join(&filename);
 
         let writer = BufWriter::new(File::create(&filename).unwrap());
         writers.push(writer);
+        files.push(filename);
     }
 
     let f = File::open(&path)?;
@@ -88,7 +96,12 @@ pub fn create_partitioned_csv(filename: &str, partitions: usize) -> Result<Strin
         w.flush().unwrap();
     }
 
-    Ok(tmp_dir.into_path().to_str().unwrap().to_string())
+    let groups = files
+        .into_iter()
+        .map(|f| vec![local_unpartitioned_file(f.to_str().unwrap().to_owned())])
+        .collect::<Vec<_>>();
+
+    Ok((tmp_dir.into_path().to_str().unwrap().to_string(), groups))
 }
 
 /// Get the schema for the aggregate_test_* csv files
@@ -277,6 +290,16 @@ pub fn make_timestamps() -> RecordBatch {
     .unwrap()
 }
 
+/// Asserts that given future is pending.
+pub fn assert_is_pending<'a, T>(fut: &mut Pin<Box<dyn Future<Output = T> + Send + 'a>>) {
+    let waker = futures::task::noop_waker();
+    let mut cx = futures::task::Context::from_waker(&waker);
+    let poll = fut.poll_unpin(&mut cx);
+
+    assert!(poll.is_pending());
+}
+
 pub mod exec;
+pub mod object_store;
 pub mod user_defined;
 pub mod variable;

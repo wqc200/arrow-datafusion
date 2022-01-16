@@ -21,6 +21,16 @@ use crate::{
         catalog::{CatalogList, MemoryCatalogList},
         information_schema::CatalogWithInformationSchema,
     },
+    datasource::listing::{ListingOptions, ListingTable},
+    datasource::{
+        file_format::{
+            avro::AvroFormat,
+            csv::CsvFormat,
+            parquet::{ParquetFormat, DEFAULT_PARQUET_EXTENSION},
+            FileFormat,
+        },
+        MemTable,
+    },
     logical_plan::{PlanType, ToStringifiedPlan},
     optimizer::eliminate_limit::EliminateLimit,
     physical_optimizer::{
@@ -41,16 +51,14 @@ use std::{
 use futures::{StreamExt, TryStreamExt};
 use tokio::task::{self, JoinHandle};
 
-use arrow::csv;
+use arrow::{csv, datatypes::SchemaRef};
 
 use crate::catalog::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
     schema::{MemorySchemaProvider, SchemaProvider},
     ResolvedTableReference, TableReference,
 };
-use crate::datasource::csv::CsvFile;
 use crate::datasource::object_store::{ObjectStore, ObjectStoreRegistry};
-use crate::datasource::parquet::ParquetTable;
 use crate::datasource::TableProvider;
 use crate::error::{DataFusionError, Result};
 use crate::execution::dataframe_impl::DataFrameImpl;
@@ -68,9 +76,6 @@ use crate::physical_optimizer::coalesce_batches::CoalesceBatches;
 use crate::physical_optimizer::merge_exec::AddCoalescePartitionsExec;
 use crate::physical_optimizer::repartition::Repartition;
 
-use crate::datasource::avro::AvroFile;
-use crate::physical_plan::avro::AvroReadOptions;
-use crate::physical_plan::csv::CsvReadOptions;
 use crate::physical_plan::planner::DefaultPhysicalPlanner;
 use crate::physical_plan::udf::ScalarUDF;
 use crate::physical_plan::ExecutionPlan;
@@ -81,9 +86,12 @@ use crate::sql::{
 };
 use crate::variable::{VarProvider, VarType};
 use crate::{dataframe::DataFrame, physical_plan::udaf::AggregateUDF};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+
+use super::options::{AvroReadOptions, CsvReadOptions};
 
 /// ExecutionContext is the main interface for executing queries with DataFusion. The context
 /// provides the following functionality:
@@ -99,9 +107,10 @@ use parquet::file::properties::WriterProperties;
 /// ```
 /// use datafusion::prelude::*;
 /// # use datafusion::error::Result;
-/// # fn main() -> Result<()> {
+/// # #[tokio::main]
+/// # async fn main() -> Result<()> {
 /// let mut ctx = ExecutionContext::new();
-/// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new())?;
+/// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new()).await?;
 /// let df = df.filter(col("a").lt_eq(col("b")))?
 ///            .aggregate(vec![col("a")], vec![min(col("b"))])?
 ///            .limit(100)?;
@@ -116,10 +125,11 @@ use parquet::file::properties::WriterProperties;
 /// use datafusion::prelude::*;
 ///
 /// # use datafusion::error::Result;
-/// # fn main() -> Result<()> {
+/// # #[tokio::main]
+/// # async fn main() -> Result<()> {
 /// let mut ctx = ExecutionContext::new();
-/// ctx.register_csv("example", "tests/example.csv", CsvReadOptions::new())?;
-/// let results = ctx.sql("SELECT a, MIN(b) FROM example GROUP BY a LIMIT 100")?;
+/// ctx.register_csv("example", "tests/example.csv", CsvReadOptions::new()).await?;
+/// let results = ctx.sql("SELECT a, MIN(b) FROM example GROUP BY a LIMIT 100").await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -174,7 +184,10 @@ impl ExecutionContext {
     }
 
     /// Creates a dataframe that will execute a SQL query.
-    pub fn sql(&mut self, sql: &str) -> Result<Arc<dyn DataFrame>> {
+    ///
+    /// This method is `async` because queries of type `CREATE EXTERNAL TABLE`
+    /// might require the schema to be inferred.
+    pub async fn sql(&mut self, sql: &str) -> Result<Arc<dyn DataFrame>> {
         let plan = self.create_logical_plan(sql)?;
         match plan {
             LogicalPlan::CreateExternalTable {
@@ -183,33 +196,77 @@ impl ExecutionContext {
                 ref location,
                 ref file_type,
                 ref has_header,
-            } => match file_type {
-                FileType::CSV => {
-                    self.register_csv(
-                        name,
-                        location,
-                        CsvReadOptions::new()
-                            .schema(&schema.as_ref().to_owned().into())
-                            .has_header(*has_header),
-                    )?;
+            } => {
+                let file_format = match file_type {
+                    FileType::CSV => {
+                        Ok(Arc::new(CsvFormat::default().with_has_header(*has_header))
+                            as Arc<dyn FileFormat>)
+                    }
+                    FileType::Parquet => {
+                        Ok(Arc::new(ParquetFormat::default()) as Arc<dyn FileFormat>)
+                    }
+                    FileType::Avro => {
+                        Ok(Arc::new(AvroFormat::default()) as Arc<dyn FileFormat>)
+                    }
+                    _ => Err(DataFusionError::NotImplemented(format!(
+                        "Unsupported file type {:?}.",
+                        file_type
+                    ))),
+                }?;
+
+                let options = ListingOptions {
+                    format: file_format,
+                    collect_stat: false,
+                    file_extension: String::new(),
+                    target_partitions: self
+                        .state
+                        .lock()
+                        .unwrap()
+                        .config
+                        .target_partitions,
+                    table_partition_cols: vec![],
+                };
+
+                // TODO make schema in CreateExternalTable optional instead of empty
+                let provided_schema = if schema.fields().is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(schema.as_ref().to_owned().into()))
+                };
+
+                self.register_listing_table(name, location, options, provided_schema)
+                    .await?;
+                let plan = LogicalPlanBuilder::empty(false).build()?;
+                Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
+            }
+
+            LogicalPlan::CreateMemoryTable { input, name } => {
+                let plan = self.optimize(&input)?;
+                let physical = Arc::new(DataFrameImpl::new(self.state.clone(), &plan));
+
+                let batches: Vec<_> = physical.collect_partitioned().await?;
+                let table = Arc::new(MemTable::try_new(
+                    Arc::new(plan.schema().as_ref().into()),
+                    batches,
+                )?);
+                self.register_table(name.as_str(), table)?;
+
+                let plan = LogicalPlanBuilder::empty(false).build()?;
+                Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
+            }
+
+            LogicalPlan::DropTable { name, if_exist, .. } => {
+                let returned = self.deregister_table(name.as_str())?;
+                if !if_exist && returned.is_none() {
+                    Err(DataFusionError::Execution(format!(
+                        "Memory table {:?} doesn't exist.",
+                        name
+                    )))
+                } else {
                     let plan = LogicalPlanBuilder::empty(false).build()?;
                     Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
                 }
-                FileType::Parquet => {
-                    self.register_parquet(name, location)?;
-                    let plan = LogicalPlanBuilder::empty(false).build()?;
-                    Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
-                }
-                FileType::Avro => {
-                    self.register_avro(name, location, AvroReadOptions::default())?;
-                    let plan = LogicalPlanBuilder::empty(false).build()?;
-                    Ok(Arc::new(DataFrameImpl::new(self.state.clone(), &plan)))
-                }
-                _ => Err(DataFusionError::NotImplemented(format!(
-                    "Unsupported file type {:?}.",
-                    file_type
-                ))),
-            },
+            }
 
             plan => Ok(Arc::new(DataFrameImpl::new(
                 self.state.clone(),
@@ -281,42 +338,74 @@ impl ExecutionContext {
 
     /// Creates a DataFrame for reading an Avro data source.
 
-    pub fn read_avro(
+    pub async fn read_avro(
         &mut self,
-        filename: impl Into<String>,
-        options: AvroReadOptions,
+        uri: impl Into<String>,
+        options: AvroReadOptions<'_>,
     ) -> Result<Arc<dyn DataFrame>> {
+        let uri: String = uri.into();
+        let (object_store, path) = self.object_store(&uri)?;
+        let target_partitions = self.state.lock().unwrap().config.target_partitions;
         Ok(Arc::new(DataFrameImpl::new(
             self.state.clone(),
-            &LogicalPlanBuilder::scan_avro(filename, options, None)?.build()?,
+            &LogicalPlanBuilder::scan_avro(
+                object_store,
+                path,
+                options,
+                None,
+                target_partitions,
+            )
+            .await?
+            .build()?,
+        )))
+    }
+
+    /// Creates an empty DataFrame.
+    pub fn read_empty(&self) -> Result<Arc<dyn DataFrame>> {
+        Ok(Arc::new(DataFrameImpl::new(
+            self.state.clone(),
+            &LogicalPlanBuilder::empty(true).build()?,
         )))
     }
 
     /// Creates a DataFrame for reading a CSV data source.
-    pub fn read_csv(
+    pub async fn read_csv(
         &mut self,
-        filename: impl Into<String>,
-        options: CsvReadOptions,
+        uri: impl Into<String>,
+        options: CsvReadOptions<'_>,
     ) -> Result<Arc<dyn DataFrame>> {
+        let uri: String = uri.into();
+        let (object_store, path) = self.object_store(&uri)?;
+        let target_partitions = self.state.lock().unwrap().config.target_partitions;
         Ok(Arc::new(DataFrameImpl::new(
             self.state.clone(),
-            &LogicalPlanBuilder::scan_csv(filename, options, None)?.build()?,
+            &LogicalPlanBuilder::scan_csv(
+                object_store,
+                path,
+                options,
+                None,
+                target_partitions,
+            )
+            .await?
+            .build()?,
         )))
     }
 
     /// Creates a DataFrame for reading a Parquet data source.
-    pub fn read_parquet(
+    pub async fn read_parquet(
         &mut self,
-        filename: impl Into<String>,
+        uri: impl Into<String>,
     ) -> Result<Arc<dyn DataFrame>> {
+        let uri: String = uri.into();
+        let (object_store, path) = self.object_store(&uri)?;
+        let target_partitions = self.state.lock().unwrap().config.target_partitions;
+        let logical_plan =
+            LogicalPlanBuilder::scan_parquet(object_store, path, None, target_partitions)
+                .await?
+                .build()?;
         Ok(Arc::new(DataFrameImpl::new(
             self.state.clone(),
-            &LogicalPlanBuilder::scan_parquet(
-                filename,
-                None,
-                self.state.lock().unwrap().config.target_partitions,
-            )?
-            .build()?,
+            &logical_plan,
         )))
     }
 
@@ -331,39 +420,88 @@ impl ExecutionContext {
         )))
     }
 
+    /// Registers a table that uses the listing feature of the object store to
+    /// find the files to be processed
+    /// This is async because it might need to resolve the schema.
+    pub async fn register_listing_table<'a>(
+        &'a mut self,
+        name: &'a str,
+        uri: &'a str,
+        options: ListingOptions,
+        provided_schema: Option<SchemaRef>,
+    ) -> Result<()> {
+        let (object_store, path) = self.object_store(uri)?;
+        let resolved_schema = match provided_schema {
+            None => {
+                options
+                    .infer_schema(Arc::clone(&object_store), path)
+                    .await?
+            }
+            Some(s) => s,
+        };
+        let table =
+            ListingTable::new(object_store, path.to_owned(), resolved_schema, options);
+        self.register_table(name, Arc::new(table))?;
+        Ok(())
+    }
+
     /// Registers a CSV data source so that it can be referenced from SQL statements
     /// executed against this context.
-    pub fn register_csv(
+    pub async fn register_csv(
         &mut self,
         name: &str,
-        filename: &str,
-        options: CsvReadOptions,
+        uri: &str,
+        options: CsvReadOptions<'_>,
     ) -> Result<()> {
-        self.register_table(name, Arc::new(CsvFile::try_new(filename, options)?))?;
+        let listing_options = options
+            .to_listing_options(self.state.lock().unwrap().config.target_partitions);
+
+        self.register_listing_table(
+            name,
+            uri,
+            listing_options,
+            options.schema.map(|s| Arc::new(s.to_owned())),
+        )
+        .await?;
+
         Ok(())
     }
 
     /// Registers a Parquet data source so that it can be referenced from SQL statements
     /// executed against this context.
-    pub fn register_parquet(&mut self, name: &str, filename: &str) -> Result<()> {
-        let table = {
+    pub async fn register_parquet(&mut self, name: &str, uri: &str) -> Result<()> {
+        let (target_partitions, enable_pruning) = {
             let m = self.state.lock().unwrap();
-            ParquetTable::try_new(filename, m.config.target_partitions)?
-                .with_enable_pruning(m.config.parquet_pruning)
+            (m.config.target_partitions, m.config.parquet_pruning)
         };
-        self.register_table(name, Arc::new(table))?;
+        let file_format = ParquetFormat::default().with_enable_pruning(enable_pruning);
+
+        let listing_options = ListingOptions {
+            format: Arc::new(file_format),
+            collect_stat: true,
+            file_extension: DEFAULT_PARQUET_EXTENSION.to_owned(),
+            target_partitions,
+            table_partition_cols: vec![],
+        };
+
+        self.register_listing_table(name, uri, listing_options, None)
+            .await?;
         Ok(())
     }
 
     /// Registers an Avro data source so that it can be referenced from SQL statements
     /// executed against this context.
-    pub fn register_avro(
+    pub async fn register_avro(
         &mut self,
         name: &str,
-        filename: &str,
-        options: AvroReadOptions,
+        uri: &str,
+        options: AvroReadOptions<'_>,
     ) -> Result<()> {
-        self.register_table(name, Arc::new(AvroFile::try_new(filename, options)?))?;
+        let listing_options = options
+            .to_listing_options(self.state.lock().unwrap().config.target_partitions);
+
+        self.register_listing_table(name, uri, listing_options, options.schema)
+            .await?;
         Ok(())
     }
 
@@ -417,8 +555,15 @@ impl ExecutionContext {
     }
 
     /// Retrieves a `ObjectStore` instance by scheme
-    pub fn object_store(&self, scheme: &str) -> Option<Arc<dyn ObjectStore>> {
-        self.state.lock().unwrap().object_store_registry.get(scheme)
+    pub fn object_store<'a>(
+        &self,
+        uri: &'a str,
+    ) -> Result<(Arc<dyn ObjectStore>, &'a str)> {
+        self.state
+            .lock()
+            .unwrap()
+            .object_store_registry
+            .get_by_uri(uri)
     }
 
     /// Registers a table using a custom `TableProvider` so that
@@ -533,17 +678,27 @@ impl ExecutionContext {
     }
 
     /// Creates a physical plan from a logical plan.
-    pub fn create_physical_plan(
+    pub async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut state = self.state.lock().unwrap();
-        state.execution_props.start_execution();
+        let (state, planner) = {
+            let mut state = self.state.lock().unwrap();
+            state.execution_props.start_execution();
 
-        state
-            .config
-            .query_planner
-            .create_physical_plan(logical_plan, &state)
+            // We need to clone `state` to release the lock that is not `Send`. We could
+            // make the lock `Send` by using `tokio::sync::Mutex`, but that would require to
+            // propagate async even to the `LogicalPlan` building methods.
+            // Cloning `state` here is fine as we then pass it as immutable `&state`, which
+            // means that we avoid write consistency issues as the cloned version will not
+            // be written to. As for eventual modifications that would be applied to the
+            // original state after it has been cloned, they will not be picked up by the
+            // clone but that is okay, as it is equivalent to postponing the state update
+            // by keeping the lock until the end of the function scope.
+            (state.clone(), Arc::clone(&state.config.query_planner))
+        };
+
+        planner.create_physical_plan(logical_plan, &state).await
     }
 
     /// Change the default catalog and schema
@@ -687,9 +842,10 @@ impl FunctionRegistry for ExecutionContext {
 }
 
 /// A planner used to add extensions to DataFusion logical and physical plans.
+#[async_trait]
 pub trait QueryPlanner {
     /// Given a `LogicalPlan`, create an `ExecutionPlan` suitable for execution
-    fn create_physical_plan(
+    async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
         ctx_state: &ExecutionContextState,
@@ -699,15 +855,16 @@ pub trait QueryPlanner {
 /// The query planner used if no user defined planner is provided
 struct DefaultQueryPlanner {}
 
+#[async_trait]
 impl QueryPlanner for DefaultQueryPlanner {
     /// Given a `LogicalPlan`, create an `ExecutionPlan` suitable for execution
-    fn create_physical_plan(
+    async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
         ctx_state: &ExecutionContextState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let planner = DefaultPhysicalPlanner::default();
-        planner.create_physical_plan(logical_plan, ctx_state)
+        planner.create_physical_plan(logical_plan, ctx_state).await
     }
 }
 
@@ -786,15 +943,6 @@ impl ExecutionConfig {
         Default::default()
     }
 
-    /// Deprecated. Use with_target_partitions instead.
-    #[deprecated(
-        since = "5.1.0",
-        note = "This method is deprecated in favor of `with_target_partitions`."
-    )]
-    pub fn with_concurrency(self, n: usize) -> Self {
-        self.with_target_partitions(n)
-    }
-
     /// Customize target_partitions
     pub fn with_target_partitions(mut self, n: usize) -> Self {
         // partition count must be greater than zero
@@ -817,6 +965,15 @@ impl ExecutionConfig {
         query_planner: Arc<dyn QueryPlanner + Send + Sync>,
     ) -> Self {
         self.query_planner = query_planner;
+        self
+    }
+
+    /// Replace the optimizer rules
+    pub fn with_optimizer_rules(
+        mut self,
+        optimizers: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
+    ) -> Self {
+        self.optimizers = optimizers;
         self
     }
 
@@ -1031,10 +1188,9 @@ impl FunctionRegistry for ExecutionContextState {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::logical_plan::{binary_expr, lit, Operator};
-    use crate::physical_plan::functions::make_scalar_function;
+    use crate::physical_plan::functions::{make_scalar_function, Volatility};
     use crate::physical_plan::{collect, collect_partitioned};
     use crate::test;
     use crate::variable::VarType;
@@ -1056,6 +1212,7 @@ mod tests {
     use arrow::compute::add;
     use arrow::datatypes::*;
     use arrow::record_batch::RecordBatch;
+    use async_trait::async_trait;
     use std::fs::File;
     use std::sync::Weak;
     use std::thread::{self, JoinHandle};
@@ -1166,7 +1323,7 @@ mod tests {
     async fn create_variable_expr() -> Result<()> {
         let tmp_dir = TempDir::new()?;
         let partition_count = 4;
-        let mut ctx = create_ctx(&tmp_dir, partition_count)?;
+        let mut ctx = create_ctx(&tmp_dir, partition_count).await?;
 
         let variable_provider = test::variable::SystemVar::new();
         ctx.register_variable(VarType::System, Arc::new(variable_provider));
@@ -1195,7 +1352,7 @@ mod tests {
     async fn register_deregister() -> Result<()> {
         let tmp_dir = TempDir::new()?;
         let partition_count = 4;
-        let mut ctx = create_ctx(&tmp_dir, partition_count)?;
+        let mut ctx = create_ctx(&tmp_dir, partition_count).await?;
 
         let provider = test::create_table_dual();
         ctx.register_table("dual", provider)?;
@@ -1210,13 +1367,13 @@ mod tests {
     async fn parallel_query_with_filter() -> Result<()> {
         let tmp_dir = TempDir::new()?;
         let partition_count = 4;
-        let ctx = create_ctx(&tmp_dir, partition_count)?;
+        let ctx = create_ctx(&tmp_dir, partition_count).await?;
 
         let logical_plan =
             ctx.create_logical_plan("SELECT c1, c2 FROM test WHERE c1 > 0 AND c1 < 3")?;
         let logical_plan = ctx.optimize(&logical_plan)?;
 
-        let physical_plan = ctx.create_physical_plan(&logical_plan)?;
+        let physical_plan = ctx.create_physical_plan(&logical_plan).await?;
 
         let results = collect_partitioned(physical_plan).await?;
 
@@ -1265,7 +1422,7 @@ mod tests {
     async fn projection_on_table_scan() -> Result<()> {
         let tmp_dir = TempDir::new()?;
         let partition_count = 4;
-        let ctx = create_ctx(&tmp_dir, partition_count)?;
+        let ctx = create_ctx(&tmp_dir, partition_count).await?;
 
         let table = ctx.table("test")?;
         let logical_plan = LogicalPlanBuilder::from(table.to_logical_plan())
@@ -1292,7 +1449,7 @@ mod tests {
         \n  TableScan: test projection=Some([1])";
         assert_eq!(format!("{:?}", optimized_plan), expected);
 
-        let physical_plan = ctx.create_physical_plan(&optimized_plan)?;
+        let physical_plan = ctx.create_physical_plan(&optimized_plan).await?;
 
         assert_eq!(1, physical_plan.schema().fields().len());
         assert_eq!("c2", physical_plan.schema().field(0).name().as_str());
@@ -1303,10 +1460,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn preserve_nullability_on_projection() -> Result<()> {
+    #[tokio::test]
+    async fn preserve_nullability_on_projection() -> Result<()> {
         let tmp_dir = TempDir::new()?;
-        let ctx = create_ctx(&tmp_dir, 1)?;
+        let ctx = create_ctx(&tmp_dir, 1).await?;
 
         let schema: Schema = ctx.table("test").unwrap().schema().clone().into();
         assert!(!schema.field_with_name("c1")?.is_nullable());
@@ -1316,7 +1473,7 @@ mod tests {
             .build()?;
 
         let plan = ctx.optimize(&plan)?;
-        let physical_plan = ctx.create_physical_plan(&Arc::new(plan))?;
+        let physical_plan = ctx.create_physical_plan(&Arc::new(plan)).await?;
         assert!(!physical_plan.schema().field_with_name("c1")?.is_nullable());
         Ok(())
     }
@@ -1368,7 +1525,7 @@ mod tests {
         );
         assert_eq!(format!("{:?}", optimized_plan), expected);
 
-        let physical_plan = ctx.create_physical_plan(&optimized_plan)?;
+        let physical_plan = ctx.create_physical_plan(&optimized_plan).await?;
 
         assert_eq!(1, physical_plan.schema().fields().len());
         assert_eq!("b", physical_plan.schema().field(0).name().as_str());
@@ -1490,7 +1647,7 @@ mod tests {
             "SELECT t1.c1, t1.c2, t2.c2 FROM test t1 JOIN test t2 USING (c2) ORDER BY t2.c2",
             1,
         )
-        .await?;
+            .await?;
         assert_eq!(results.len(), 1);
 
         let expected = vec![
@@ -1520,7 +1677,7 @@ mod tests {
             "SELECT t1.c1, t1.c2, t2.c2 FROM test t1 JOIN test t2 ON t1.c2 = t2.c2 ORDER BY t1.c2",
             1,
         )
-        .await?;
+            .await?;
         assert_eq!(results.len(), 1);
 
         let expected = vec![
@@ -1684,15 +1841,15 @@ mod tests {
         .await?;
 
         let expected = vec![
-            "+----+----+--------------+-----------------------------------+----------------------------------+------------------------------------------+--------------+----------------+--------------+--------------+--------------+",
-            "| c1 | c2 | ROW_NUMBER() | FIRST_VALUE(test.c2 Plus test.c1) | LAST_VALUE(test.c2 Plus test.c1) | NTH_VALUE(test.c2 Plus test.c1,Int64(1)) | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
-            "+----+----+--------------+-----------------------------------+----------------------------------+------------------------------------------+--------------+----------------+--------------+--------------+--------------+",
-            "| 0  | 1  | 1            | 1                                 | 1                                | 1                                        | 1            | 1              | 1            | 1            | 1            |",
-            "| 0  | 2  | 1            | 2                                 | 2                                | 2                                        | 2            | 1              | 2            | 2            | 2            |",
-            "| 0  | 3  | 1            | 3                                 | 3                                | 3                                        | 3            | 1              | 3            | 3            | 3            |",
-            "| 0  | 4  | 1            | 4                                 | 4                                | 4                                        | 4            | 1              | 4            | 4            | 4            |",
-            "| 0  | 5  | 1            | 5                                 | 5                                | 5                                        | 5            | 1              | 5            | 5            | 5            |",
-            "+----+----+--------------+-----------------------------------+----------------------------------+------------------------------------------+--------------+----------------+--------------+--------------+--------------+",
+            "+----+----+--------------+--------------------------------+-------------------------------+---------------------------------------+--------------+----------------+--------------+--------------+--------------+",
+            "| c1 | c2 | ROW_NUMBER() | FIRST_VALUE(test.c2 + test.c1) | LAST_VALUE(test.c2 + test.c1) | NTH_VALUE(test.c2 + test.c1,Int64(1)) | SUM(test.c2) | COUNT(test.c2) | MAX(test.c2) | MIN(test.c2) | AVG(test.c2) |",
+            "+----+----+--------------+--------------------------------+-------------------------------+---------------------------------------+--------------+----------------+--------------+--------------+--------------+",
+            "| 0  | 1  | 1            | 1                              | 1                             | 1                                     | 1            | 1              | 1            | 1            | 1            |",
+            "| 0  | 2  | 1            | 2                              | 2                             | 2                                     | 2            | 1              | 2            | 2            | 2            |",
+            "| 0  | 3  | 1            | 3                              | 3                             | 3                                     | 3            | 1              | 3            | 3            | 3            |",
+            "| 0  | 4  | 1            | 4                              | 4                             | 4                                     | 4            | 1              | 4            | 4            | 4            |",
+            "| 0  | 5  | 1            | 5                              | 5                             | 5                                     | 5            | 1              | 5            | 5            | 5            |",
+            "+----+----+--------------+--------------------------------+-------------------------------+---------------------------------------+--------------+----------------+--------------+--------------+--------------+",
         ];
 
         // window function shall respect ordering
@@ -1853,7 +2010,12 @@ mod tests {
         let results =
             execute("SELECT c1, AVG(c2) FROM test WHERE c1 = 123 GROUP BY c1", 4).await?;
 
-        let expected = vec!["++", "||", "++", "++"];
+        let expected = vec![
+            "+----+--------------+",
+            "| c1 | AVG(test.c2) |",
+            "+----+--------------+",
+            "+----+--------------+",
+        ];
         assert_batches_sorted_eq!(expected, &results);
 
         Ok(())
@@ -1900,7 +2062,7 @@ mod tests {
     #[tokio::test]
     async fn aggregate_timestamps_sum() -> Result<()> {
         let tmp_dir = TempDir::new()?;
-        let mut ctx = create_ctx(&tmp_dir, 1)?;
+        let mut ctx = create_ctx(&tmp_dir, 1).await?;
         ctx.register_table("t", test::table_with_timestamps())
             .unwrap();
 
@@ -1919,7 +2081,7 @@ mod tests {
     #[tokio::test]
     async fn aggregate_timestamps_count() -> Result<()> {
         let tmp_dir = TempDir::new()?;
-        let mut ctx = create_ctx(&tmp_dir, 1)?;
+        let mut ctx = create_ctx(&tmp_dir, 1).await?;
         ctx.register_table("t", test::table_with_timestamps())
             .unwrap();
 
@@ -1945,7 +2107,7 @@ mod tests {
     #[tokio::test]
     async fn aggregate_timestamps_min() -> Result<()> {
         let tmp_dir = TempDir::new()?;
-        let mut ctx = create_ctx(&tmp_dir, 1)?;
+        let mut ctx = create_ctx(&tmp_dir, 1).await?;
         ctx.register_table("t", test::table_with_timestamps())
             .unwrap();
 
@@ -1971,7 +2133,7 @@ mod tests {
     #[tokio::test]
     async fn aggregate_timestamps_max() -> Result<()> {
         let tmp_dir = TempDir::new()?;
-        let mut ctx = create_ctx(&tmp_dir, 1)?;
+        let mut ctx = create_ctx(&tmp_dir, 1).await?;
         ctx.register_table("t", test::table_with_timestamps())
             .unwrap();
 
@@ -1997,7 +2159,7 @@ mod tests {
     #[tokio::test]
     async fn aggregate_timestamps_avg() -> Result<()> {
         let tmp_dir = TempDir::new()?;
-        let mut ctx = create_ctx(&tmp_dir, 1)?;
+        let mut ctx = create_ctx(&tmp_dir, 1).await?;
         ctx.register_table("t", test::table_with_timestamps())
             .unwrap();
 
@@ -2037,7 +2199,7 @@ mod tests {
     async fn join_partitioned() -> Result<()> {
         // self join on partition id (workaround for duplicate column name)
         let results = execute(
-            "SELECT 1 FROM test JOIN (SELECT c1 AS id1 FROM test) ON c1=id1",
+            "SELECT 1 FROM test JOIN (SELECT c1 AS id1 FROM test) AS a ON c1=id1",
             4,
         )
         .await?;
@@ -2046,6 +2208,56 @@ mod tests {
             results.iter().map(|b| b.num_rows()).sum::<usize>(),
             4 * 10 * 10
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_timestamp() -> Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let mut ctx = create_ctx(&tmp_dir, 1).await?;
+        ctx.register_table("t", test::table_with_timestamps())
+            .unwrap();
+
+        let expected = vec![
+            "+-------------------------------+----------------------------+-------------------------+---------------------+-------+-------------------------------+----------------------------+-------------------------+---------------------+-------+",
+            "| nanos                         | micros                     | millis                  | secs                | name  | nanos                         | micros                     | millis                  | secs                | name  |",
+            "+-------------------------------+----------------------------+-------------------------+---------------------+-------+-------------------------------+----------------------------+-------------------------+---------------------+-------+",
+            "| 2011-12-13 11:13:10.123450    | 2011-12-13 11:13:10.123450 | 2011-12-13 11:13:10.123 | 2011-12-13 11:13:10 | Row 1 | 2011-12-13 11:13:10.123450    | 2011-12-13 11:13:10.123450 | 2011-12-13 11:13:10.123 | 2011-12-13 11:13:10 | Row 1 |",
+            "| 2018-11-13 17:11:10.011375885 | 2018-11-13 17:11:10.011375 | 2018-11-13 17:11:10.011 | 2018-11-13 17:11:10 | Row 0 | 2018-11-13 17:11:10.011375885 | 2018-11-13 17:11:10.011375 | 2018-11-13 17:11:10.011 | 2018-11-13 17:11:10 | Row 0 |",
+            "| 2021-01-01 05:11:10.432       | 2021-01-01 05:11:10.432    | 2021-01-01 05:11:10.432 | 2021-01-01 05:11:10 | Row 3 | 2021-01-01 05:11:10.432       | 2021-01-01 05:11:10.432    | 2021-01-01 05:11:10.432 | 2021-01-01 05:11:10 | Row 3 |",
+            "+-------------------------------+----------------------------+-------------------------+---------------------+-------+-------------------------------+----------------------------+-------------------------+---------------------+-------+",
+        ];
+
+        let results = plan_and_collect(
+            &mut ctx,
+            "SELECT * FROM t as t1  \
+             JOIN (SELECT * FROM t) as t2 \
+             ON t1.nanos = t2.nanos",
+        )
+        .await
+        .unwrap();
+        assert_batches_sorted_eq!(expected, &results);
+
+        let results = plan_and_collect(
+            &mut ctx,
+            "SELECT * FROM t as t1  \
+             JOIN (SELECT * FROM t) as t2 \
+             ON t1.micros = t2.micros",
+        )
+        .await
+        .unwrap();
+        assert_batches_sorted_eq!(expected, &results);
+
+        let results = plan_and_collect(
+            &mut ctx,
+            "SELECT * FROM t as t1  \
+             JOIN (SELECT * FROM t) as t2 \
+             ON t1.millis = t2.millis",
+        )
+        .await
+        .unwrap();
+        assert_batches_sorted_eq!(expected, &results);
 
         Ok(())
     }
@@ -2121,7 +2333,7 @@ mod tests {
 
             // generate some data
             for i in 0..10 {
-                let data = format!("{},2020-12-{}T00:00:00.000\n", i, i + 10);
+                let data = format!("{},2020-12-{}T00:00:00.000Z\n", i, i + 10);
                 file.write_all(data.as_bytes())?;
             }
         }
@@ -2130,7 +2342,8 @@ mod tests {
             "test",
             tmp_dir.path().to_str().unwrap(),
             CsvReadOptions::new().schema(&schema).has_header(false),
-        )?;
+        )
+        .await?;
 
         let results = plan_and_collect(
             &mut ctx,
@@ -2360,7 +2573,8 @@ mod tests {
             "test",
             tmp_dir.path().to_str().unwrap(),
             CsvReadOptions::new().schema(&schema).has_header(false),
-        )?;
+        )
+        .await?;
 
         let results = plan_and_collect(
             &mut ctx,
@@ -2444,10 +2658,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn aggregate_with_alias() -> Result<()> {
+    #[tokio::test]
+    async fn aggregate_with_alias() -> Result<()> {
         let tmp_dir = TempDir::new()?;
-        let ctx = create_ctx(&tmp_dir, 1)?;
+        let ctx = create_ctx(&tmp_dir, 1).await?;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("c1", DataType::Utf8, false),
@@ -2461,7 +2675,7 @@ mod tests {
 
         let plan = ctx.optimize(&plan)?;
 
-        let physical_plan = ctx.create_physical_plan(&Arc::new(plan))?;
+        let physical_plan = ctx.create_physical_plan(&Arc::new(plan)).await?;
         assert_eq!("c1", physical_plan.schema().field(0).name().as_str());
         assert_eq!(
             "total_salary",
@@ -2473,7 +2687,7 @@ mod tests {
     #[tokio::test]
     async fn limit() -> Result<()> {
         let tmp_dir = TempDir::new()?;
-        let mut ctx = create_ctx(&tmp_dir, 1)?;
+        let mut ctx = create_ctx(&tmp_dir, 1).await?;
         ctx.register_table("t", test::table_with_sequence(1, 1000).unwrap())
             .unwrap();
 
@@ -2513,7 +2727,7 @@ mod tests {
     #[tokio::test]
     async fn limit_multi_partitions() -> Result<()> {
         let tmp_dir = TempDir::new()?;
-        let mut ctx = create_ctx(&tmp_dir, 1)?;
+        let mut ctx = create_ctx(&tmp_dir, 1).await?;
 
         let partitions = vec![
             vec![test::make_partition(0)],
@@ -2667,6 +2881,7 @@ mod tests {
             "MY_FUNC",
             vec![DataType::Int32],
             Arc::new(DataType::Int32),
+            Volatility::Immutable,
             myfunc,
         ));
 
@@ -2745,6 +2960,7 @@ mod tests {
             "MY_AVG",
             DataType::Float64,
             Arc::new(DataType::Float64),
+            Volatility::Immutable,
             Arc::new(|| Ok(Box::new(AvgAccumulator::try_new(&DataType::Float64)?))),
             Arc::new(vec![DataType::UInt64, DataType::Float64]),
         );
@@ -2779,7 +2995,7 @@ mod tests {
     async fn write_csv_results() -> Result<()> {
         // create partitioned input file and context
         let tmp_dir = TempDir::new()?;
-        let mut ctx = create_ctx(&tmp_dir, 4)?;
+        let mut ctx = create_ctx(&tmp_dir, 4).await?;
 
         // execute a simple query and write the results to CSV
         let out_dir = tmp_dir.as_ref().to_str().unwrap().to_string() + "/out";
@@ -2795,8 +3011,10 @@ mod tests {
 
         // register each partition as well as the top level dir
         let csv_read_option = CsvReadOptions::new().schema(&schema);
-        ctx.register_csv("part0", &format!("{}/part-0.csv", out_dir), csv_read_option)?;
-        ctx.register_csv("allparts", &out_dir, csv_read_option)?;
+        ctx.register_csv("part0", &format!("{}/part-0.csv", out_dir), csv_read_option)
+            .await?;
+        ctx.register_csv("allparts", &out_dir, csv_read_option)
+            .await?;
 
         let part0 = plan_and_collect(&mut ctx, "SELECT c1, c2 FROM part0").await?;
         let allparts = plan_and_collect(&mut ctx, "SELECT c1, c2 FROM allparts").await?;
@@ -2814,7 +3032,7 @@ mod tests {
     async fn write_parquet_results() -> Result<()> {
         // create partitioned input file and context
         let tmp_dir = TempDir::new()?;
-        let mut ctx = create_ctx(&tmp_dir, 4)?;
+        let mut ctx = create_ctx(&tmp_dir, 4).await?;
 
         // execute a simple query and write the results to CSV
         let out_dir = tmp_dir.as_ref().to_str().unwrap().to_string() + "/out";
@@ -2824,11 +3042,15 @@ mod tests {
         let mut ctx = ExecutionContext::new();
 
         // register each partition as well as the top level dir
-        ctx.register_parquet("part0", &format!("{}/part-0.parquet", out_dir))?;
-        ctx.register_parquet("part1", &format!("{}/part-1.parquet", out_dir))?;
-        ctx.register_parquet("part2", &format!("{}/part-2.parquet", out_dir))?;
-        ctx.register_parquet("part3", &format!("{}/part-3.parquet", out_dir))?;
-        ctx.register_parquet("allparts", &out_dir)?;
+        ctx.register_parquet("part0", &format!("{}/part-0.parquet", out_dir))
+            .await?;
+        ctx.register_parquet("part1", &format!("{}/part-1.parquet", out_dir))
+            .await?;
+        ctx.register_parquet("part2", &format!("{}/part-2.parquet", out_dir))
+            .await?;
+        ctx.register_parquet("part3", &format!("{}/part-3.parquet", out_dir))
+            .await?;
+        ctx.register_parquet("allparts", &out_dir).await?;
 
         let part0 = plan_and_collect(&mut ctx, "SELECT c1, c2 FROM part0").await?;
         let allparts = plan_and_collect(&mut ctx, "SELECT c1, c2 FROM allparts").await?;
@@ -2857,7 +3079,8 @@ mod tests {
             CsvReadOptions::new()
                 .schema(&schema)
                 .file_extension(file_extension),
-        )?;
+        )
+        .await?;
         let results =
             plan_and_collect(&mut ctx, "SELECT SUM(c1), SUM(c2), COUNT(*) FROM test")
                 .await?;
@@ -2875,13 +3098,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn send_context_to_threads() -> Result<()> {
+    #[tokio::test]
+    async fn send_context_to_threads() -> Result<()> {
         // ensure ExecutionContexts can be used in a multi-threaded
         // environment. Usecase is for concurrent planing.
         let tmp_dir = TempDir::new()?;
         let partition_count = 4;
-        let ctx = Arc::new(Mutex::new(create_ctx(&tmp_dir, partition_count)?));
+        let ctx = Arc::new(Mutex::new(create_ctx(&tmp_dir, partition_count).await?));
 
         let threads: Vec<JoinHandle<Result<_>>> = (0..2)
             .map(|_| ctx.clone())
@@ -2902,15 +3125,17 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn ctx_sql_should_optimize_plan() -> Result<()> {
+    #[tokio::test]
+    async fn ctx_sql_should_optimize_plan() -> Result<()> {
         let mut ctx = ExecutionContext::new();
-        let plan1 =
-            ctx.create_logical_plan("SELECT * FROM (SELECT 1) WHERE TRUE AND TRUE")?;
+        let plan1 = ctx
+            .create_logical_plan("SELECT * FROM (SELECT 1) AS one WHERE TRUE AND TRUE")?;
 
         let opt_plan1 = ctx.optimize(&plan1)?;
 
-        let plan2 = ctx.sql("SELECT * FROM (SELECT 1) WHERE TRUE AND TRUE")?;
+        let plan2 = ctx
+            .sql("SELECT * FROM (SELECT 1) AS one WHERE TRUE AND TRUE")
+            .await?;
 
         assert_eq!(
             format!("{:?}", opt_plan1),
@@ -2957,6 +3182,7 @@ mod tests {
             "my_add",
             vec![DataType::Int32, DataType::Int32],
             Arc::new(DataType::Int32),
+            Volatility::Immutable,
             myfunc,
         ));
 
@@ -2979,7 +3205,7 @@ mod tests {
         );
 
         let plan = ctx.optimize(&plan)?;
-        let plan = ctx.create_physical_plan(&plan)?;
+        let plan = ctx.create_physical_plan(&plan).await?;
         let result = collect(plan).await?;
 
         let expected = vec![
@@ -3084,6 +3310,7 @@ mod tests {
             "my_avg",
             DataType::Float64,
             Arc::new(DataType::Float64),
+            Volatility::Immutable,
             Arc::new(|| Ok(Box::new(AvgAccumulator::try_new(&DataType::Float64)?))),
             Arc::new(vec![DataType::UInt64, DataType::Float64]),
         );
@@ -3110,7 +3337,7 @@ mod tests {
             ExecutionConfig::new().with_query_planner(Arc::new(MyQueryPlanner {})),
         );
 
-        let df = ctx.sql("SELECT 1")?;
+        let df = ctx.sql("SELECT 1").await?;
         df.collect().await.expect_err("query not supported");
         Ok(())
     }
@@ -3249,6 +3476,7 @@ mod tests {
     async fn information_schema_tables_table_types() {
         struct TestTable(TableType);
 
+        #[async_trait]
         impl TableProvider for TestTable {
             fn as_any(&self) -> &dyn std::any::Any {
                 self
@@ -3262,7 +3490,7 @@ mod tests {
                 unimplemented!()
             }
 
-            fn scan(
+            async fn scan(
                 &self,
                 _: &Option<Vec<usize>>,
                 _: usize,
@@ -3597,7 +3825,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            ctx.sql("select * from datafusion.public.test"),
+            ctx.sql("select * from datafusion.public.test").await,
             Err(DataFusionError::Plan(_))
         ));
 
@@ -3662,7 +3890,7 @@ mod tests {
                     SELECT i, 'a' AS cat FROM catalog_a.schema_a.table_a
                     UNION ALL
                     SELECT i, 'b' AS cat FROM catalog_b.schema_b.table_b
-                )
+                ) AS all
                 GROUP BY cat
                 ORDER BY cat
                 ",
@@ -3686,8 +3914,8 @@ mod tests {
     async fn create_external_table_with_timestamps() {
         let mut ctx = ExecutionContext::new();
 
-        let data = "Jorge,2018-12-13T12:12:10.011\n\
-                    Andrew,2018-11-13T17:11:10.011";
+        let data = "Jorge,2018-12-13T12:12:10.011Z\n\
+                    Andrew,2018-11-13T17:11:10.011Z";
 
         let tmp_dir = TempDir::new().unwrap();
         let file_path = tmp_dir.path().join("timestamps.csv");
@@ -3764,10 +3992,65 @@ mod tests {
         assert_eq!(Weak::strong_count(&catalog_weak), 0);
     }
 
+    #[tokio::test]
+    async fn schema_merge_ignores_metadata() {
+        // Create two parquet files in same table with same schema but different metadata
+        let tmp_dir = TempDir::new().unwrap();
+        let table_dir = tmp_dir.path().join("parquet_test");
+        let table_path = Path::new(&table_dir);
+
+        let mut non_empty_metadata: HashMap<String, String> = HashMap::new();
+        non_empty_metadata.insert("testing".to_string(), "metadata".to_string());
+
+        let fields = vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ];
+        let schemas = vec![
+            Arc::new(Schema::new_with_metadata(
+                fields.clone(),
+                non_empty_metadata.clone(),
+            )),
+            Arc::new(Schema::new(fields.clone())),
+        ];
+
+        if let Ok(()) = fs::create_dir(table_path) {
+            for (i, schema) in schemas.iter().enumerate().take(2) {
+                let filename = format!("part-{}.parquet", i);
+                let path = table_path.join(&filename);
+                let file = fs::File::create(path).unwrap();
+                let mut writer =
+                    ArrowWriter::try_new(file.try_clone().unwrap(), schema.clone(), None)
+                        .unwrap();
+
+                // create mock record batch
+                let ids = Arc::new(Int32Array::from(vec![i as i32]));
+                let names = Arc::new(StringArray::from(vec!["test"]));
+                let rec_batch =
+                    RecordBatch::try_new(schema.clone(), vec![ids, names]).unwrap();
+
+                writer.write(&rec_batch).unwrap();
+                writer.close().unwrap();
+            }
+        }
+
+        // Read the parquet files into a dataframe to confirm results
+        // (no errors)
+        let mut ctx = ExecutionContext::new();
+        let df = ctx
+            .read_parquet(table_dir.to_str().unwrap().to_string())
+            .await
+            .unwrap();
+        let result = df.collect().await.unwrap();
+
+        assert_eq!(result[0].schema().metadata(), result[1].schema().metadata());
+    }
+
     struct MyPhysicalPlanner {}
 
+    #[async_trait]
     impl PhysicalPlanner for MyPhysicalPlanner {
-        fn create_physical_plan(
+        async fn create_physical_plan(
             &self,
             _logical_plan: &LogicalPlan,
             _ctx_state: &ExecutionContextState,
@@ -3790,14 +4073,17 @@ mod tests {
 
     struct MyQueryPlanner {}
 
+    #[async_trait]
     impl QueryPlanner for MyQueryPlanner {
-        fn create_physical_plan(
+        async fn create_physical_plan(
             &self,
             logical_plan: &LogicalPlan,
             ctx_state: &ExecutionContextState,
         ) -> Result<Arc<dyn ExecutionPlan>> {
             let physical_planner = MyPhysicalPlanner {};
-            physical_planner.create_physical_plan(logical_plan, ctx_state)
+            physical_planner
+                .create_physical_plan(logical_plan, ctx_state)
+                .await
         }
     }
 
@@ -3806,13 +4092,13 @@ mod tests {
         ctx: &mut ExecutionContext,
         sql: &str,
     ) -> Result<Vec<RecordBatch>> {
-        ctx.sql(sql)?.collect().await
+        ctx.sql(sql).await?.collect().await
     }
 
     /// Execute SQL and return results
     async fn execute(sql: &str, partition_count: usize) -> Result<Vec<RecordBatch>> {
         let tmp_dir = TempDir::new()?;
-        let mut ctx = create_ctx(&tmp_dir, partition_count)?;
+        let mut ctx = create_ctx(&tmp_dir, partition_count).await?;
         plan_and_collect(&mut ctx, sql).await
     }
 
@@ -3824,7 +4110,7 @@ mod tests {
     ) -> Result<()> {
         let logical_plan = ctx.create_logical_plan(sql)?;
         let logical_plan = ctx.optimize(&logical_plan)?;
-        let physical_plan = ctx.create_physical_plan(&logical_plan)?;
+        let physical_plan = ctx.create_physical_plan(&logical_plan).await?;
         ctx.write_csv(physical_plan, out_dir.to_string()).await
     }
 
@@ -3837,7 +4123,7 @@ mod tests {
     ) -> Result<()> {
         let logical_plan = ctx.create_logical_plan(sql)?;
         let logical_plan = ctx.optimize(&logical_plan)?;
-        let physical_plan = ctx.create_physical_plan(&logical_plan)?;
+        let physical_plan = ctx.create_physical_plan(&logical_plan).await?;
         ctx.write_parquet(physical_plan, out_dir.to_string(), writer_properties)
             .await
     }
@@ -3872,7 +4158,10 @@ mod tests {
     }
 
     /// Generate a partitioned CSV file and register it with an execution context
-    fn create_ctx(tmp_dir: &TempDir, partition_count: usize) -> Result<ExecutionContext> {
+    async fn create_ctx(
+        tmp_dir: &TempDir,
+        partition_count: usize,
+    ) -> Result<ExecutionContext> {
         let mut ctx = ExecutionContext::with_config(
             ExecutionConfig::new().with_target_partitions(8),
         );
@@ -3884,8 +4173,40 @@ mod tests {
             "test",
             tmp_dir.path().to_str().unwrap(),
             CsvReadOptions::new().schema(&schema),
-        )?;
+        )
+        .await?;
 
         Ok(ctx)
+    }
+
+    // Test for compilation error when calling read_* functions from an #[async_trait] function.
+    // See https://github.com/apache/arrow-datafusion/issues/1154
+    #[async_trait]
+    trait CallReadTrait {
+        async fn call_read_csv(&self) -> Arc<dyn DataFrame>;
+        async fn call_read_avro(&self) -> Arc<dyn DataFrame>;
+        async fn call_read_parquet(&self) -> Arc<dyn DataFrame>;
+    }
+
+    struct CallRead {}
+
+    #[async_trait]
+    impl CallReadTrait for CallRead {
+        async fn call_read_csv(&self) -> Arc<dyn DataFrame> {
+            let mut ctx = ExecutionContext::new();
+            ctx.read_csv("dummy", CsvReadOptions::new()).await.unwrap()
+        }
+
+        async fn call_read_avro(&self) -> Arc<dyn DataFrame> {
+            let mut ctx = ExecutionContext::new();
+            ctx.read_avro("dummy", AvroReadOptions::default())
+                .await
+                .unwrap()
+        }
+
+        async fn call_read_parquet(&self) -> Arc<dyn DataFrame> {
+            let mut ctx = ExecutionContext::new();
+            ctx.read_parquet("dummy").await.unwrap()
+        }
     }
 }
