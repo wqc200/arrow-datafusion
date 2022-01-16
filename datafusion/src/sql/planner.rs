@@ -999,7 +999,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     /// Wrap the logical in a sort
-    fn order_by(
+    pub fn order_by(
         &self,
         plan: LogicalPlan,
         order_by: &[OrderByExpr],
