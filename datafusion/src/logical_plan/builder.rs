@@ -624,14 +624,7 @@ pub(crate) fn expand_wildcard(
         Ok(schema
             .fields()
             .iter()
-            .filter_map(|f| {
-                let col = f.qualified_column();
-                if !col.name.eq("rowid") {
-                    Some(Expr::Column(col))
-                } else {
-                    None
-                }
-            })
+            .map(|f| Expr::Column(f.qualified_column()))
             .collect::<Vec<Expr>>())
     } else {
         Ok(schema
