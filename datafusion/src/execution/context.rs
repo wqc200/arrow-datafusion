@@ -701,6 +701,17 @@ impl ExecutionContext {
         planner.create_physical_plan(logical_plan, &state).await
     }
 
+    /// Change the default catalog and schema
+    pub fn change_default_catalog_and_schema(
+        &mut self,
+        catalog: impl Into<String>,
+        schema: impl Into<String>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        state.config.default_catalog = catalog.into();
+        state.config.default_schema = schema.into();
+    }
+
     /// Executes a query and writes the results to a partitioned CSV file.
     pub async fn write_csv(
         &self,
